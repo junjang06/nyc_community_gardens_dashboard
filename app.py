@@ -1,16 +1,13 @@
 """
 NYC Community Gardens for Equitable Climate Resilience
-Production-ready Streamlit dashboard with official NYC Open Data loading and mock-data fallbacks.
+
+Deployment-stable Streamlit dashboard built with pandas, shapely, plotly, and pydeck.
+This version intentionally avoids geopandas/fiona/GDAL because those packages often fail
+on Streamlit Community Cloud builds.
 
 Run locally:
     pip install -r requirements.txt
     streamlit run app.py
-
-Primary data sources:
-    GreenThumb Garden Info: p78i-pat6
-    2020 Neighborhood Tabulation Areas: 9nt8-h7nd
-    Heat Vulnerability Index Rankings: 4mhf-duep
-    Optional local population file: data/nta_population.csv
 """
 
 from __future__ import annotations
@@ -19,9 +16,9 @@ import json
 import math
 import random
 import re
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -30,7 +27,9 @@ import pydeck as pdk
 import requests
 import streamlit as st
 from shapely import wkt
-from shapely.geometry import Point, box, shape
+from shapely.geometry import Point, box, mapping, shape
+from shapely.ops import transform
+from shapely.prepared import prep
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -44,37 +43,93 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Constants and styling
+# Constants
 # -----------------------------------------------------------------------------
 
 GREENTHUMB_ID = "p78i-pat6"
 NTA_ID = "9nt8-h7nd"
 HVI_ID = "4mhf-duep"
-POPULATION_ID = "swpk-hqdp"  # Older NYC NTA population table; local 2020 CSV is preferred.
 
 SODA_JSON = "https://data.cityofnewyork.us/resource/{dataset_id}.json?$limit=50000"
 SODA_GEOJSON = "https://data.cityofnewyork.us/api/views/{dataset_id}/rows.geojson?accessType=DOWNLOAD"
 SODA_GEOSPATIAL_EXPORT = (
     "https://data.cityofnewyork.us/api/geospatial/{dataset_id}?method=export&format=GeoJSON"
 )
+CDTA_HVI_ARCGIS = (
+    "https://services1.arcgis.com/8cuieNI8NbqQZQVJ/ArcGIS/rest/services/"
+    "HVI_by_CDTA_CRAD_2024/FeatureServer/0/query?where=1%3D1&outFields=*&f=json"
+)
 
 NYC_CENTER = {"lat": 40.7128, "lon": -74.0060}
+EARTH_RADIUS_FT = 20_925_524.9
 AREA_SQFT_PER_SQMI = 27_878_400
-NYC_LOCAL_CRS = "EPSG:2263"  # NAD83 / New York Long Island ftUS
-WGS84 = "EPSG:4326"
 
+# Higher-contrast, more legible civic-tech palette.
 PALETTE = {
-    "forest": "#12372A",
-    "sage": "#9CAF88",
-    "cream": "#F6F2E8",
-    "terracotta": "#C76F4A",
-    "mint": "#DDE8D1",
-    "ink": "#1E2A24",
-    "muted": "#66756D",
+    "forest": "#0E3327",
+    "forest_2": "#164B3A",
+    "sage": "#DCE8D5",
+    "sage_dark": "#6F8F76",
+    "cream": "#FAF8F1",
     "white": "#FFFFFF",
+    "terracotta": "#B85C38",
+    "terracotta_light": "#FFF0E8",
+    "ink": "#18251F",
+    "muted": "#56645E",
+    "line": "#D9DED3",
 }
 
 BOROUGH_ORDER = ["Bronx", "Brooklyn", "Manhattan", "Queens", "Staten Island"]
+BOROUGH_ABBR = {
+    "Bronx": "BX",
+    "Brooklyn": "BK",
+    "Manhattan": "MN",
+    "Queens": "QN",
+    "Staten Island": "SI",
+}
+
+DATASET_FACTORS = [
+    {
+        "Dataset": "GreenThumb Garden Info",
+        "Source ID": GREENTHUMB_ID,
+        "What goes into it": "Garden identity and location records maintained by NYC Parks GreenThumb.",
+        "Fields used in dashboard": "garden/site name, borough, status when available, address when available, geometry or latitude/longitude converted to a point.",
+        "Dashboard role": "Maps garden locations; counts gardens by borough and by NTA.",
+    },
+    {
+        "Dataset": "2020 Neighborhood Tabulation Areas",
+        "Source ID": NTA_ID,
+        "What goes into it": "2020 NTA statistical geography polygons created by NYC Planning from 2020 census tract groupings.",
+        "Fields used in dashboard": "NTA code, NTA name, borough, polygon geometry.",
+        "Dashboard role": "Defines neighborhood boundaries for spatial join, access score, density, and choropleth maps.",
+    },
+    {
+        "Dataset": "NTA Population",
+        "Source ID": "local CSV: data/nta_population.csv",
+        "What goes into it": "2020 Census total population by residential NTA, stored locally for stable deployment.",
+        "Fields used in dashboard": "nta_code, nta_name, population.",
+        "Dashboard role": "Creates Garden Access Score = gardens per 10,000 residents.",
+    },
+    {
+        "Dataset": "Heat Vulnerability Index",
+        "Source ID": HVI_ID,
+        "What goes into it": "NYC Health HVI summarizes heat risk using social and environmental factors.",
+        "Fields used in dashboard": "HVI rank 1 to 5; CDTA proxy is used when direct NTA matching is unavailable.",
+        "Dashboard role": "Creates climate vulnerability layer and priority classification.",
+    },
+]
+
+HVI_FACTOR_ROWS = [
+    {"HVI factor": "Median household income", "Interpretation": "Lower income can reduce ability to afford and use cooling resources."},
+    {"HVI factor": "Percent vegetative cover", "Interpretation": "Tree, grass, and shrub cover can reduce neighborhood heat exposure."},
+    {"HVI factor": "Percent Non-Hispanic Black population", "Interpretation": "Included by NYC Health because heat impacts reflect structural inequities and historic disinvestment."},
+    {"HVI factor": "Average surface temperature", "Interpretation": "Hotter land-surface temperatures are associated with greater heat-wave mortality risk."},
+    {"HVI factor": "Percent households reporting air-conditioning access", "Interpretation": "AC access is protective during extreme heat events."},
+]
+
+# -----------------------------------------------------------------------------
+# Styling
+# -----------------------------------------------------------------------------
 
 st.markdown(
     f"""
@@ -83,11 +138,21 @@ st.markdown(
             background: {PALETTE['cream']};
             color: {PALETTE['ink']};
         }}
+        .block-container {{
+            padding-top: 2rem;
+            max-width: 1340px;
+        }}
         [data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, #12372A 0%, #1E4A39 100%);
+            background: {PALETTE['forest']};
+            border-right: 1px solid rgba(255,255,255,0.12);
         }}
         [data-testid="stSidebar"] * {{
-            color: #F6F2E8 !important;
+            color: #FDFBF4 !important;
+        }}
+        [data-testid="stSidebar"] .stSelectbox div,
+        [data-testid="stSidebar"] .stSlider div,
+        [data-testid="stSidebar"] .stRadio div {{
+            color: #FDFBF4 !important;
         }}
         .main-title {{
             font-size: 2.55rem;
@@ -95,16 +160,27 @@ st.markdown(
             font-weight: 850;
             color: {PALETTE['forest']};
             margin-bottom: 0.15rem;
+            letter-spacing: -0.035em;
         }}
         .guiding-question {{
-            font-size: 1.28rem;
-            font-weight: 650;
-            color: {PALETTE['terracotta']};
-            background: #FFF8EF;
-            border-left: 6px solid {PALETTE['terracotta']};
+            font-size: 1.22rem;
+            font-weight: 700;
+            color: {PALETTE['ink']};
+            background: {PALETTE['white']};
+            border-left: 7px solid {PALETTE['terracotta']};
+            border: 1px solid {PALETTE['line']};
             padding: 1rem 1.1rem;
-            border-radius: 0.65rem;
-            margin: 0.6rem 0 1.0rem 0;
+            border-radius: 0.8rem;
+            margin: 0.75rem 0 1.05rem 0;
+            box-shadow: 0 6px 22px rgba(14,51,39,0.06);
+        }}
+        .eyebrow {{
+            text-transform: uppercase;
+            letter-spacing: .11em;
+            font-size: .78rem;
+            color: {PALETTE['sage_dark']};
+            font-weight: 850;
+            margin-bottom: .25rem;
         }}
         .subtle {{
             color: {PALETTE['muted']};
@@ -112,101 +188,128 @@ st.markdown(
         }}
         .kpi-card {{
             background: {PALETTE['white']};
-            border: 1px solid #E6E1D5;
+            border: 1px solid {PALETTE['line']};
             border-radius: 1rem;
             padding: 1rem 1.05rem;
-            box-shadow: 0 4px 14px rgba(18, 55, 42, 0.08);
+            box-shadow: 0 5px 16px rgba(14, 51, 39, 0.08);
             min-height: 118px;
         }}
         .kpi-label {{
-            font-size: 0.82rem;
+            font-size: 0.78rem;
             text-transform: uppercase;
             letter-spacing: .08em;
             color: {PALETTE['muted']};
-            font-weight: 750;
+            font-weight: 850;
         }}
         .kpi-value {{
-            font-size: 2rem;
+            font-size: 2.05rem;
             color: {PALETTE['forest']};
-            font-weight: 850;
+            font-weight: 900;
             margin-top: 0.25rem;
         }}
         .callout {{
-            background: {PALETTE['mint']};
+            background: {PALETTE['sage']};
             border-left: 6px solid {PALETTE['forest']};
-            border-radius: 0.75rem;
+            border-radius: 0.85rem;
             padding: 0.95rem 1.05rem;
             margin: 0.75rem 0;
             color: {PALETTE['ink']};
+            border-top: 1px solid rgba(14,51,39,0.10);
+            border-right: 1px solid rgba(14,51,39,0.10);
+            border-bottom: 1px solid rgba(14,51,39,0.10);
         }}
         .warning-callout {{
-            background: #FFF1E8;
+            background: {PALETTE['terracotta_light']};
             border-left: 6px solid {PALETTE['terracotta']};
-            border-radius: 0.75rem;
+            border-radius: 0.85rem;
             padding: 0.95rem 1.05rem;
             margin: 0.75rem 0;
             color: {PALETTE['ink']};
+            border-top: 1px solid rgba(184,92,56,0.22);
+            border-right: 1px solid rgba(184,92,56,0.22);
+            border-bottom: 1px solid rgba(184,92,56,0.22);
         }}
-        .action-card {{
-            background: #FFFFFF;
-            border: 1px solid #E6E1D5;
+        .action-card, .sdg-card {{
+            background: {PALETTE['white']};
+            border: 1px solid {PALETTE['line']};
             border-radius: 1rem;
             padding: 1rem 1.1rem;
-            box-shadow: 0 4px 12px rgba(18, 55, 42, 0.07);
-            min-height: 178px;
+            box-shadow: 0 5px 16px rgba(14, 51, 39, 0.07);
+            min-height: 168px;
         }}
         .badge {{
             display: inline-block;
             border-radius: 999px;
-            padding: 0.32rem 0.68rem;
+            padding: 0.34rem 0.7rem;
             margin: 0.12rem 0.2rem 0.12rem 0;
             background: {PALETTE['forest']};
             color: #FFFFFF;
+            font-weight: 850;
+            font-size: 0.82rem;
+        }}
+        .metric-pill {{
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.25rem 0.65rem;
+            margin: 0.15rem 0.15rem 0.15rem 0;
+            background: #EEF4EA;
+            color: {PALETTE['forest']};
+            border: 1px solid {PALETTE['line']};
             font-weight: 750;
             font-size: 0.82rem;
         }}
-        .sdg-card {{
-            background: #FFFFFF;
-            border-radius: 1rem;
-            border: 1px solid #E6E1D5;
-            padding: 1rem;
-            min-height: 172px;
-            box-shadow: 0 4px 12px rgba(18, 55, 42, 0.06);
-        }}
         div[data-testid="stMetric"] {{
-            background: white;
+            background: {PALETTE['white']};
             padding: 0.85rem;
             border-radius: 0.9rem;
-            border: 1px solid #E6E1D5;
+            border: 1px solid {PALETTE['line']};
         }}
-        .block-container {{padding-top: 2rem;}}
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: .35rem;
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            background: #FFFFFF;
+            border: 1px solid {PALETTE['line']};
+            border-radius: .75rem .75rem 0 0;
+            padding: .75rem .9rem;
+            color: {PALETTE['ink']};
+            font-weight: 750;
+        }}
+        .stTabs [aria-selected="true"] {{
+            background: {PALETTE['forest']} !important;
+            color: #FFFFFF !important;
+        }}
+        hr {{
+            border: none;
+            border-top: 1px solid {PALETTE['line']};
+            margin: 1.25rem 0;
+        }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # -----------------------------------------------------------------------------
-# Utility helpers
+# Utility functions
 # -----------------------------------------------------------------------------
 
 
-def normalize_col_name(col: str) -> str:
-    """Normalize raw Socrata/CSV column names for safer matching."""
+def normalize_col_name(col: object) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", str(col).strip().lower()).strip("_")
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [normalize_col_name(c) for c in df.columns]
-    return df
+    out = df.copy()
+    out.columns = [normalize_col_name(c) for c in out.columns]
+    return out
 
 
 def first_existing(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    cols = set(df.columns)
-    for c in candidates:
-        c_norm = normalize_col_name(c)
-        if c_norm in cols:
-            return c_norm
+    existing = set(df.columns)
+    for col in candidates:
+        c = normalize_col_name(col)
+        if c in existing:
+            return c
     return None
 
 
@@ -215,59 +318,7 @@ def normalize_text_key(value: object) -> str:
         return ""
     value = str(value).lower().strip()
     value = re.sub(r"[^a-z0-9 ]+", " ", value)
-    value = re.sub(r"\s+", " ", value)
-    return value
-
-
-def safe_numeric(series: pd.Series, default: float = np.nan) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(default)
-
-
-def request_json(url: str, timeout: int = 25) -> List[Dict]:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    if isinstance(data, dict) and "error" in data:
-        raise ValueError(data.get("message", data["error"]))
-    if not isinstance(data, list):
-        raise ValueError("Expected a list of JSON records from Socrata API.")
-    return data
-
-
-def get_borough_options(gdf: gpd.GeoDataFrame) -> List[str]:
-    if "borough" not in gdf.columns:
-        return ["All boroughs"]
-    found = [b for b in BOROUGH_ORDER if b in set(gdf["borough"].dropna().astype(str))]
-    extra = sorted(set(gdf["borough"].dropna().astype(str)) - set(found))
-    return ["All boroughs"] + found + extra
-
-
-def filtered_by_borough(gdf: gpd.GeoDataFrame, borough: str) -> gpd.GeoDataFrame:
-    if borough == "All boroughs" or "borough" not in gdf.columns:
-        return gdf.copy()
-    return gdf[gdf["borough"].astype(str) == borough].copy()
-
-
-def friendly_metric_name(metric: str) -> str:
-    names = {
-        "garden_count": "Garden Count",
-        "garden_access_score": "Gardens per 10,000 Residents",
-        "garden_density_per_sq_mile": "Gardens per Square Mile",
-        "hvi_rank": "Heat Vulnerability Index",
-    }
-    return names.get(metric, metric.replace("_", " ").title())
-
-
-def city_median(series: pd.Series) -> float:
-    value = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).median()
-    if pd.isna(value):
-        return 0.0
-    return float(value)
-
-
-def gdf_to_geojson(gdf: gpd.GeoDataFrame) -> Dict:
-    """Convert a GeoDataFrame to a JSON-serializable GeoJSON dict for Plotly."""
-    return json.loads(gdf.to_json())
+    return re.sub(r"\s+", " ", value)
 
 
 def standardize_borough(value: object) -> Optional[str]:
@@ -297,13 +348,86 @@ def standardize_borough(value: object) -> Optional[str]:
     return mapping.get(v, str(value).strip())
 
 
+def request_json(url: str, timeout: int = 30):
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def lonlat_to_local_feet(lon: float, lat: float) -> Tuple[float, float]:
+    lat0 = math.radians(NYC_CENTER["lat"])
+    x = math.radians(lon - NYC_CENTER["lon"]) * EARTH_RADIUS_FT * math.cos(lat0)
+    y = math.radians(lat - NYC_CENTER["lat"]) * EARTH_RADIUS_FT
+    return x, y
+
+
+def approximate_area_sq_mi(geom) -> float:
+    try:
+        projected = transform(lambda x, y, z=None: lonlat_to_local_feet(x, y), geom)
+        return float(projected.area / AREA_SQFT_PER_SQMI)
+    except Exception:
+        return np.nan
+
+
+def city_median(series: pd.Series) -> float:
+    med = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).median()
+    return 0.0 if pd.isna(med) else float(med)
+
+
+def format_num(value: float, digits: int = 1) -> str:
+    if pd.isna(value):
+        return "—"
+    return f"{value:,.{digits}f}"
+
+
+def get_borough_options(df: pd.DataFrame) -> List[str]:
+    if "borough" not in df.columns:
+        return ["All boroughs"]
+    found = [b for b in BOROUGH_ORDER if b in set(df["borough"].dropna().astype(str))]
+    extra = sorted(set(df["borough"].dropna().astype(str)) - set(found))
+    return ["All boroughs"] + found + extra
+
+
+def filtered_by_borough(df: pd.DataFrame, borough: str) -> pd.DataFrame:
+    if borough == "All boroughs" or "borough" not in df.columns:
+        return df.copy()
+    return df[df["borough"].astype(str) == borough].copy()
+
+
+def friendly_metric_name(metric: str) -> str:
+    names = {
+        "garden_count": "Garden Count",
+        "garden_access_score": "Gardens per 10,000 Residents",
+        "garden_density_per_sq_mile": "Gardens per Square Mile",
+        "hvi_rank": "Heat Vulnerability Index",
+    }
+    return names.get(metric, metric.replace("_", " ").title())
+
+
+def df_to_geojson(df: pd.DataFrame) -> Dict:
+    features = []
+    for _, row in df.iterrows():
+        geom = row.get("geometry")
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        props = {k: v for k, v in row.items() if k != "geometry"}
+        clean_props = {}
+        for k, v in props.items():
+            if isinstance(v, (np.integer, np.floating)):
+                clean_props[k] = float(v) if not pd.isna(v) else None
+            elif pd.isna(v):
+                clean_props[k] = None
+            else:
+                clean_props[k] = str(v) if not isinstance(v, (int, float, bool)) else v
+        features.append({"type": "Feature", "properties": clean_props, "geometry": mapping(geom)})
+    return {"type": "FeatureCollection", "features": features}
+
 # -----------------------------------------------------------------------------
-# Mock data fallbacks
+# Mock fallbacks
 # -----------------------------------------------------------------------------
 
 
-def create_mock_nta_data() -> gpd.GeoDataFrame:
-    """Create deterministic simplified NTA-like polygons for offline demos."""
+def create_mock_nta_data() -> pd.DataFrame:
     borough_specs = {
         "Bronx": (-73.91, 40.83, 0.045, 0.035),
         "Brooklyn": (-73.96, 40.64, 0.055, 0.04),
@@ -328,11 +452,10 @@ def create_mock_nta_data() -> gpd.GeoDataFrame:
                     }
                 )
                 idx += 1
-    return gpd.GeoDataFrame(records, geometry="geometry", crs=WGS84)
+    return pd.DataFrame(records)
 
 
-def create_mock_garden_data() -> gpd.GeoDataFrame:
-    """Create deterministic garden points clustered by borough for offline demos."""
+def create_mock_garden_data() -> pd.DataFrame:
     random.seed(42)
     centers = {
         "Bronx": (-73.90, 40.84, 24),
@@ -345,6 +468,7 @@ def create_mock_garden_data() -> gpd.GeoDataFrame:
     garden_id = 1
     for borough, (lon, lat, n) in centers.items():
         for i in range(n):
+            point = Point(lon + random.uniform(-0.045, 0.045), lat + random.uniform(-0.035, 0.035))
             rows.append(
                 {
                     "garden_id": f"MOCK-G{garden_id:04d}",
@@ -352,21 +476,18 @@ def create_mock_garden_data() -> gpd.GeoDataFrame:
                     "borough": borough,
                     "status": "Active" if i % 7 != 0 else "Other / Unknown",
                     "address": "Mock address for offline fallback",
+                    "geometry": point,
+                    "lon": point.x,
+                    "lat": point.y,
                     "mock_garden": True,
-                    "geometry": Point(
-                        lon + random.uniform(-0.045, 0.045),
-                        lat + random.uniform(-0.035, 0.035),
-                    ),
                 }
             )
             garden_id += 1
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=WGS84)
+    return pd.DataFrame(rows)
 
 
-def create_mock_population_data(nta_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-    """Create deterministic population placeholders keyed to NTA code."""
+def create_mock_population_data(nta_df: pd.DataFrame) -> pd.DataFrame:
     rng = np.random.default_rng(7)
-    df = nta_gdf[["nta_code", "nta_name", "borough"]].copy()
     borough_base = {
         "Bronx": 41000,
         "Brooklyn": 52000,
@@ -374,6 +495,7 @@ def create_mock_population_data(nta_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
         "Queens": 48000,
         "Staten Island": 33000,
     }
+    df = nta_df[["nta_code", "nta_name", "borough"]].copy()
     df["population"] = [
         int(borough_base.get(b, 45000) + rng.integers(-12000, 15000)) for b in df["borough"]
     ]
@@ -381,209 +503,113 @@ def create_mock_population_data(nta_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     return df
 
 
-def create_mock_hvi_data(nta_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-    """Create deterministic HVI placeholders keyed to NTA code."""
+def create_mock_hvi_data(nta_df: pd.DataFrame) -> pd.DataFrame:
     rng = np.random.default_rng(11)
     base = {"Bronx": 4, "Brooklyn": 3, "Manhattan": 2, "Queens": 3, "Staten Island": 2}
-    hvi = nta_gdf[["nta_code", "nta_name", "borough"]].copy()
-    hvi["hvi_rank"] = [
-        int(np.clip(base.get(b, 3) + rng.choice([-1, 0, 0, 1]), 1, 5)) for b in hvi["borough"]
-    ]
-    hvi["hvi_source"] = "mock_placeholder"
-    return hvi
-
+    df = nta_df[["nta_code", "nta_name", "borough"]].copy()
+    df["hvi_rank"] = [int(np.clip(base.get(b, 3) + rng.choice([-1, 0, 0, 1]), 1, 5)) for b in df["borough"]]
+    df["hvi_source"] = "mock_placeholder"
+    return df
 
 # -----------------------------------------------------------------------------
-# Data loading functions
+# Data loaders
 # -----------------------------------------------------------------------------
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_greenthumb_data() -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Load official NYC GreenThumb Garden Info data.
-
-    The official dataset may include polygon/multipolygon geometry instead of lat/lon.
-    clean_garden_points() converts whatever geometry exists into point locations.
-    """
     status = {
         "dataset": "GreenThumb Garden Info",
         "dataset_id": GREENTHUMB_ID,
-        "source": "NYC Open Data",
+        "source": "NYC Open Data GeoJSON/API",
         "mock": "False",
-        "message": "Loaded from NYC Open Data GeoJSON/API.",
+        "message": "Loaded official garden records from NYC Open Data.",
     }
-
-    geojson_url = SODA_GEOJSON.format(dataset_id=GREENTHUMB_ID)
-    json_url = SODA_JSON.format(dataset_id=GREENTHUMB_ID)
-
     try:
-        gdf = gpd.read_file(geojson_url)
-        if len(gdf) == 0:
-            raise ValueError("GeoJSON returned no rows.")
-        gdf = normalize_columns(gdf)
-        return gdf, status
+        geo = request_json(SODA_GEOJSON.format(dataset_id=GREENTHUMB_ID))
+        rows = []
+        for i, feat in enumerate(geo.get("features", [])):
+            props = feat.get("properties", {}) or {}
+            geom_raw = feat.get("geometry")
+            geom = shape(geom_raw) if geom_raw else None
+            props["geometry"] = geom
+            props["source_row"] = i
+            rows.append(props)
+        df = normalize_columns(pd.DataFrame(rows))
+        if len(df) == 0:
+            raise ValueError("GreenThumb GeoJSON returned no features.")
+        return df, status
     except Exception as geo_error:
         try:
-            records = request_json(json_url)
+            records = request_json(SODA_JSON.format(dataset_id=GREENTHUMB_ID))
             df = normalize_columns(pd.DataFrame(records))
-            status["message"] = f"Loaded from NYC Open Data JSON after GeoJSON fallback: {geo_error}"
+            status["source"] = "NYC Open Data JSON"
+            status["message"] = f"Loaded garden records from JSON after GeoJSON issue: {geo_error}"
             return df, status
-        except Exception as json_error:
-            mock = create_mock_garden_data()
-            status["mock"] = "True"
-            status["source"] = "Mock fallback"
-            status[
-                "message"
-            ] = f"Live GreenThumb data unavailable. Using mock fallback. Error: {json_error}"
-            return mock, status
+        except Exception as exc:
+            status.update({"source": "Mock fallback", "mock": "True", "message": f"Live garden data unavailable. Using mock sample. Error: {exc}"})
+            return create_mock_garden_data(), status
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def load_nta_boundaries() -> Tuple[gpd.GeoDataFrame, Dict[str, str]]:
-    """Load official 2020 NTA boundaries from NYC Open Data."""
+def load_nta_boundaries() -> Tuple[pd.DataFrame, Dict[str, str]]:
     status = {
         "dataset": "2020 Neighborhood Tabulation Areas",
         "dataset_id": NTA_ID,
-        "source": "NYC Open Data",
+        "source": "NYC Open Data geospatial export",
         "mock": "False",
-        "message": "Loaded from NYC Open Data geospatial export.",
+        "message": "Loaded official 2020 NTA boundaries.",
     }
-
-    urls = [
-        SODA_GEOSPATIAL_EXPORT.format(dataset_id=NTA_ID),
-        SODA_GEOJSON.format(dataset_id=NTA_ID),
-    ]
     last_error = None
-    for url in urls:
+    for url in [SODA_GEOSPATIAL_EXPORT.format(dataset_id=NTA_ID), SODA_GEOJSON.format(dataset_id=NTA_ID)]:
         try:
-            gdf = gpd.read_file(url)
-            if len(gdf) == 0:
-                raise ValueError("NTA endpoint returned no rows.")
-            gdf = normalize_columns(gdf)
+            geo = request_json(url)
+            rows = []
+            for i, feat in enumerate(geo.get("features", [])):
+                props = feat.get("properties", {}) or {}
+                geom_raw = feat.get("geometry")
+                if not geom_raw:
+                    continue
+                props["geometry"] = shape(geom_raw)
+                props["source_row"] = i
+                rows.append(props)
+            raw = normalize_columns(pd.DataFrame(rows))
+            if len(raw) == 0:
+                raise ValueError("NTA endpoint returned no features.")
 
-            code_col = first_existing(
-                gdf,
-                [
-                    "nta2020",
-                    "nta2020_code",
-                    "ntacode",
-                    "nta_code",
-                    "geoid",
-                    "nta",
-                    "ntacode2020",
-                ],
-            )
-            name_col = first_existing(
-                gdf,
-                [
-                    "ntaname",
-                    "nta_name",
-                    "nta2020_name",
-                    "name",
-                    "neighborhood",
-                    "ntaname2020",
-                ],
-            )
-            boro_col = first_existing(
-                gdf,
-                [
-                    "boroname",
-                    "boro_name",
-                    "borough",
-                    "boro",
-                    "borocode",
-                    "boro_code",
-                ],
-            )
-
-            if code_col is None:
-                gdf["nta_code"] = [f"NTA_{i:04d}" for i in range(len(gdf))]
-            else:
-                gdf["nta_code"] = gdf[code_col].astype(str)
-
-            if name_col is None:
-                gdf["nta_name"] = gdf["nta_code"]
-            else:
-                gdf["nta_name"] = gdf[name_col].astype(str)
-
-            if boro_col is None:
-                gdf["borough"] = "Unknown"
-            else:
-                gdf["borough"] = gdf[boro_col].apply(standardize_borough)
-
-            if gdf.crs is None:
-                gdf = gdf.set_crs(WGS84)
-            else:
-                gdf = gdf.to_crs(WGS84)
-
-            keep = ["nta_code", "nta_name", "borough", "geometry"]
-            gdf = gdf[keep].copy()
-            gdf["mock_nta"] = False
-            return gdf, status
+            code_col = first_existing(raw, ["nta2020", "nta2020_code", "ntacode", "nta_code", "geoid", "nta", "ntacode2020"])
+            name_col = first_existing(raw, ["ntaname", "nta_name", "nta2020_name", "name", "neighborhood", "ntaname2020"])
+            boro_col = first_existing(raw, ["boroname", "boro_name", "borough", "boro", "borocode", "boro_code"])
+            out = pd.DataFrame()
+            out["nta_code"] = raw[code_col].astype(str) if code_col else [f"NTA_{i:04d}" for i in range(len(raw))]
+            out["nta_name"] = raw[name_col].astype(str) if name_col else out["nta_code"]
+            out["borough"] = raw[boro_col].apply(standardize_borough) if boro_col else "Unknown"
+            out["geometry"] = raw["geometry"]
+            out["mock_nta"] = False
+            return out, status
         except Exception as exc:
             last_error = exc
-
-    mock = create_mock_nta_data()
-    status["mock"] = "True"
-    status["source"] = "Mock fallback"
-    status["message"] = f"Live NTA boundaries unavailable. Using mock fallback. Error: {last_error}"
-    return mock, status
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
-def load_hvi_data() -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """Load official Heat Vulnerability Index Rankings from NYC Open Data."""
-    status = {
-        "dataset": "Heat Vulnerability Index Rankings",
-        "dataset_id": HVI_ID,
-        "source": "NYC Open Data",
-        "mock": "False",
-        "message": "Loaded from NYC Open Data JSON.",
-    }
-    try:
-        records = request_json(SODA_JSON.format(dataset_id=HVI_ID))
-        df = normalize_columns(pd.DataFrame(records))
-        if len(df) == 0:
-            raise ValueError("HVI endpoint returned no rows.")
-        return df, status
-    except Exception as exc:
-        status["mock"] = "True"
-        status["source"] = "Mock fallback pending NTA join"
-        status["message"] = f"Live HVI data unavailable. Will use mock HVI fallback. Error: {exc}"
-        return pd.DataFrame(), status
+    status.update({"source": "Mock fallback", "mock": "True", "message": f"Live NTA boundaries unavailable. Using mock boundaries. Error: {last_error}"})
+    return create_mock_nta_data(), status
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def load_population_data(nta_reference: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Load population denominators.
-
-    Preferred production path:
-        Place a clean CSV at data/nta_population.csv with columns:
-            nta_code, nta_name, population
-
-    The older NYC Open Data population table is attempted as a secondary source, but it may
-    use older NTA definitions. If neither source works, mock placeholders are generated.
-    """
     status = {
         "dataset": "NTA population",
-        "dataset_id": "local CSV preferred / swpk-hqdp fallback",
-        "source": "Local CSV or NYC Open Data fallback",
+        "dataset_id": "data/nta_population.csv",
+        "source": "Local CSV",
         "mock": "False",
-        "message": "Loaded population data.",
+        "message": "Loaded local 2020 NTA population CSV.",
     }
-
-    local_paths = ["data/nta_population.csv", "nta_population.csv"]
-    for path in local_paths:
+    for path in [Path("data/nta_population.csv"), Path("nta_population.csv")]:
         try:
-            df = pd.read_csv(path)
-            df = normalize_columns(df)
+            df = normalize_columns(pd.read_csv(path))
             pop_col = first_existing(df, ["population", "pop", "total_population", "pop_2020"])
             code_col = first_existing(df, ["nta_code", "ntacode", "nta2020", "geoid"])
             name_col = first_existing(df, ["nta_name", "ntaname", "nta2020_name", "name"])
             if pop_col is None or (code_col is None and name_col is None):
-                raise ValueError("Population CSV needs population plus nta_code or nta_name.")
+                raise ValueError("Population CSV requires population plus nta_code or nta_name.")
             out = pd.DataFrame()
             if code_col:
                 out["nta_code"] = df[code_col].astype(str)
@@ -591,258 +617,226 @@ def load_population_data(nta_reference: Optional[pd.DataFrame] = None) -> Tuple[
                 out["nta_name"] = df[name_col].astype(str)
             out["population"] = pd.to_numeric(df[pop_col], errors="coerce")
             out = out.dropna(subset=["population"])
-            out["population_source"] = path
-            status["source"] = path
+            out["population_source"] = str(path)
             status["message"] = f"Loaded local population file: {path}"
             return out, status
         except Exception:
             continue
-
-    # Optional API fallback. This is not ideal for 2020 NTA boundaries, but useful for prototyping.
-    try:
-        records = request_json(SODA_JSON.format(dataset_id=POPULATION_ID))
-        df = normalize_columns(pd.DataFrame(records))
-        pop_col = first_existing(
-            df,
-            [
-                "population",
-                "population_2010",
-                "pop_2010",
-                "total_population",
-                "p0010001",
-                "count",
-            ],
-        )
-        code_col = first_existing(df, ["nta_code", "ntacode", "nta", "geoid"])
-        name_col = first_existing(df, ["nta_name", "ntaname", "name"])
-        if pop_col is None or (code_col is None and name_col is None):
-            raise ValueError("Could not identify population columns in API fallback.")
-        out = pd.DataFrame()
-        if code_col:
-            out["nta_code"] = df[code_col].astype(str)
-        if name_col:
-            out["nta_name"] = df[name_col].astype(str)
-        out["population"] = pd.to_numeric(df[pop_col], errors="coerce")
-        out = out.dropna(subset=["population"])
-        out["population_source"] = f"NYC Open Data {POPULATION_ID}; verify boundary year"
-        status["source"] = f"NYC Open Data {POPULATION_ID}; verify boundary year"
-        status[
-            "message"
-        ] = "Loaded API fallback population table. Verify NTA year compatibility before formal use."
-        return out, status
-    except Exception as exc:
-        if nta_reference is not None and len(nta_reference) > 0:
-            mock = create_mock_population_data(nta_reference)
-        else:
-            mock = pd.DataFrame(
-                {
-                    "nta_code": [],
-                    "nta_name": [],
-                    "population": [],
-                    "population_source": [],
-                }
-            )
-        status["mock"] = "True"
-        status["source"] = "Mock fallback"
-        status["message"] = f"Population data unavailable. Using mock placeholders. Error: {exc}"
-        return mock, status
+    if nta_reference is not None and len(nta_reference) > 0:
+        mock = create_mock_population_data(nta_reference)
+    else:
+        mock = pd.DataFrame(columns=["nta_code", "nta_name", "population", "population_source"])
+    status.update({"source": "Mock fallback", "mock": "True", "message": "Population file not found or unreadable. Using mock denominators."})
+    return mock, status
 
 
-# -----------------------------------------------------------------------------
-# Cleaning and metric engineering functions
-# -----------------------------------------------------------------------------
-
-
-def clean_garden_points(raw_data: pd.DataFrame | gpd.GeoDataFrame) -> Tuple[gpd.GeoDataFrame, Dict[str, str]]:
-    """
-    Convert raw garden records into a point GeoDataFrame.
-
-    Logic:
-    1. Use existing GeoDataFrame geometry when available.
-    2. If geometry is polygon/multipolygon, use representative points for mapping and joins.
-    3. If latitude/longitude columns exist, build points.
-    4. If WKT geometry columns exist, parse them.
-    5. If none exist, return mock sample and clearly mark it as mock.
-    """
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_hvi_data() -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Load HVI. Preferred: local NTA HVI. Secondary: official NYC Health CDTA proxy. Tertiary: Open Data HVI table."""
     status = {
+        "dataset": "Heat Vulnerability Index",
+        "dataset_id": HVI_ID,
+        "source": "NYC Open Data / NYC Health",
         "mock": "False",
-        "message": "Garden locations cleaned from available geometry/coordinates.",
+        "message": "Loaded HVI records.",
     }
 
+    # Optional local NTA-level file, if later added.
+    for path in [Path("data/hvi_nta.csv"), Path("hvi_nta.csv")]:
+        try:
+            if path.exists():
+                df = normalize_columns(pd.read_csv(path))
+                rank_col = first_existing(df, ["hvi_rank", "hvi", "heat_vulnerability_index", "rank"])
+                code_col = first_existing(df, ["nta_code", "ntacode", "nta2020", "geoid"])
+                name_col = first_existing(df, ["nta_name", "ntaname", "name"])
+                if rank_col is None or (code_col is None and name_col is None):
+                    raise ValueError("Local HVI CSV requires hvi_rank plus nta_code or nta_name.")
+                out = pd.DataFrame()
+                if code_col:
+                    out["nta_code"] = df[code_col].astype(str)
+                if name_col:
+                    out["nta_name"] = df[name_col].astype(str)
+                    out["nta_name_key"] = out["nta_name"].map(normalize_text_key)
+                out["hvi_rank"] = pd.to_numeric(df[rank_col], errors="coerce").clip(1, 5)
+                out = out.dropna(subset=["hvi_rank"])
+                out["hvi_source"] = str(path)
+                status.update({"source": str(path), "message": f"Loaded local NTA-level HVI file: {path}"})
+                return out, status
+        except Exception:
+            continue
+
+    # Official CDTA-level HVI proxy from NYC Health/ArcGIS.
+    try:
+        data = request_json(CDTA_HVI_ARCGIS)
+        features = data.get("features", [])
+        rows = [f.get("attributes", {}) for f in features]
+        raw = normalize_columns(pd.DataFrame(rows))
+        if len(raw) == 0:
+            raise ValueError("CDTA HVI endpoint returned no rows.")
+        rank_col = first_existing(raw, ["hvi", "hvi_rank", "heat_vulnerability_index", "rank"])
+        comm_col = first_existing(raw, ["commdist", "cdta", "cdta2020", "community_district", "community_district_tabulation_area"])
+        boro_col = first_existing(raw, ["borough", "boro", "boroname"])
+        if rank_col is None:
+            raise ValueError("Could not identify HVI rank field in CDTA endpoint.")
+        out = pd.DataFrame()
+        out["hvi_rank"] = pd.to_numeric(raw[rank_col], errors="coerce").clip(1, 5)
+        if comm_col:
+            out["cdta_code"] = raw[comm_col].astype(str).str.upper().str.extract(r"([A-Z]{2}\s*\d{1,2})", expand=False)
+            # If the field is numeric like 301 and borough is available, create BK01-style code.
+            if out["cdta_code"].isna().all() and boro_col:
+                boro = raw[boro_col].apply(standardize_borough).map(BOROUGH_ABBR)
+                nums = raw[comm_col].astype(str).str.extract(r"(\d{1,2})$", expand=False).str.zfill(2)
+                out["cdta_code"] = boro + nums
+            out["cdta_code"] = out["cdta_code"].str.replace(" ", "", regex=False)
+        else:
+            raise ValueError("Could not identify CDTA/community district field.")
+        out = out.dropna(subset=["hvi_rank", "cdta_code"])
+        if len(out) == 0:
+            raise ValueError("CDTA HVI records could not be standardized.")
+        out["hvi_source"] = "NYC Health CDTA HVI proxy"
+        status.update({"source": "NYC Health CDTA HVI proxy", "message": "Loaded official CDTA-level HVI and will assign to NTAs by parent CDTA code."})
+        return out, status
+    except Exception as cdta_error:
+        # Keep official Open Data HVI for transparency, even if it cannot join to NTA directly.
+        try:
+            records = request_json(SODA_JSON.format(dataset_id=HVI_ID))
+            raw = normalize_columns(pd.DataFrame(records))
+            if len(raw) == 0:
+                raise ValueError("Open Data HVI endpoint returned no rows.")
+            rank_col = first_existing(raw, ["hvi_rank", "hvi", "heat_vulnerability_index", "rank", "score"])
+            out = raw.copy()
+            if rank_col:
+                out["hvi_rank"] = pd.to_numeric(out[rank_col], errors="coerce").clip(1, 5)
+            out["hvi_source"] = f"NYC Open Data {HVI_ID}; direct NTA join may be unavailable"
+            status.update({"source": f"NYC Open Data {HVI_ID}", "message": f"Loaded HVI table after CDTA proxy failed. Direct NTA join may be unavailable. CDTA error: {cdta_error}"})
+            return out, status
+        except Exception as exc:
+            status.update({"source": "Mock fallback pending NTA join", "mock": "True", "message": f"HVI unavailable. Mock fallback will be used. Error: {exc}"})
+            return pd.DataFrame(), status
+
+# -----------------------------------------------------------------------------
+# Cleaning and metric engineering
+# -----------------------------------------------------------------------------
+
+
+def standardize_garden_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_columns(df)
+    name_col = first_existing(df, ["gardenname", "garden_name", "name", "site_name", "garden", "park_name", "propertyname"])
+    boro_col = first_existing(df, ["borough", "boro", "boroname", "boro_name", "county"])
+    status_col = first_existing(df, ["status", "garden_status", "active", "operational_status"])
+    address_col = first_existing(df, ["address", "location", "street_address", "full_address"])
+    id_col = first_existing(df, ["garden_id", "gispropnum", "property_id", "objectid", "source_row"])
+
+    out = pd.DataFrame()
+    out["garden_id"] = df[id_col].astype(str) if id_col else [f"G{i:05d}" for i in range(len(df))]
+    out["garden_name"] = df[name_col].astype(str) if name_col else [f"Community Garden {i + 1}" for i in range(len(df))]
+    out["borough"] = df[boro_col].apply(standardize_borough) if boro_col else None
+    out["status"] = df[status_col].astype(str).fillna("Unknown") if status_col else "Unknown"
+    out["address"] = df[address_col].astype(str).fillna("") if address_col else ""
+    out["geometry"] = df["geometry"]
+    out["lon"] = out["geometry"].apply(lambda g: g.x if isinstance(g, Point) else np.nan)
+    out["lat"] = out["geometry"].apply(lambda g: g.y if isinstance(g, Point) else np.nan)
+    out["mock_garden"] = df["mock_garden"] if "mock_garden" in df.columns else False
+    return out.dropna(subset=["lon", "lat"]).copy()
+
+
+def clean_garden_points(raw_data: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    status = {"mock": "False", "message": "Garden locations cleaned from geometry or coordinates."}
     if raw_data is None or len(raw_data) == 0:
-        status["mock"] = "True"
-        status["message"] = "No garden data supplied. Using mock garden points."
+        status.update({"mock": "True", "message": "No garden data supplied. Using mock garden points."})
         return create_mock_garden_data(), status
 
     df = normalize_columns(raw_data)
+    geometries = []
 
-    # 1. Existing GeoDataFrame geometry
-    if isinstance(df, gpd.GeoDataFrame) and "geometry" in df.columns and df.geometry.notna().any():
-        gdf = df.copy()
-        if gdf.crs is None:
-            gdf = gdf.set_crs(WGS84)
-        # Convert any geometry type to a point representation.
-        try:
-            metric = gdf.to_crs(NYC_LOCAL_CRS)
-            point_geom = metric.geometry.representative_point()
-            gdf = gpd.GeoDataFrame(
-                gdf.drop(columns=["geometry"]), geometry=point_geom, crs=NYC_LOCAL_CRS
-            ).to_crs(WGS84)
-        except Exception:
-            gdf = gdf.to_crs(WGS84)
-            gdf["geometry"] = gdf.geometry.centroid
-        cleaned = standardize_garden_columns(gdf)
-        return cleaned, status
+    if "geometry" in df.columns and df["geometry"].notna().any():
+        for geom in df["geometry"]:
+            if geom is None or pd.isna(geom):
+                geometries.append(None)
+            elif isinstance(geom, Point):
+                geometries.append(geom)
+            else:
+                try:
+                    geometries.append(geom.representative_point())
+                except Exception:
+                    geometries.append(None)
+        df["geometry"] = geometries
+        cleaned = standardize_garden_columns(df.dropna(subset=["geometry"]))
+        if len(cleaned) > 0:
+            return cleaned, status
 
-    # 2. Latitude/longitude columns
     lat_col = first_existing(df, ["latitude", "lat", "y", "garden_latitude"])
     lon_col = first_existing(df, ["longitude", "lon", "lng", "long", "x", "garden_longitude"])
-    if lat_col is not None and lon_col is not None:
+    if lat_col and lon_col:
         lat = pd.to_numeric(df[lat_col], errors="coerce")
         lon = pd.to_numeric(df[lon_col], errors="coerce")
         valid = lat.between(40.45, 40.95) & lon.between(-74.35, -73.65)
         if valid.any():
-            gdf = gpd.GeoDataFrame(
-                df.loc[valid].copy(), geometry=gpd.points_from_xy(lon[valid], lat[valid]), crs=WGS84
-            )
-            cleaned = standardize_garden_columns(gdf)
-            return cleaned, status
+            df = df.loc[valid].copy()
+            df["geometry"] = [Point(xy) for xy in zip(lon.loc[valid], lat.loc[valid])]
+            return standardize_garden_columns(df), status
 
-    # 3. WKT geometry columns
     geom_col = first_existing(df, ["multipolygon", "polygon", "the_geom", "geom", "geometry"])
     if geom_col:
         parsed = []
         for value in df[geom_col]:
             geom = None
             try:
-                if isinstance(value, str) and any(
-                    token in value.upper() for token in ["POINT", "POLYGON", "MULTIPOLYGON"]
-                ):
+                if isinstance(value, str) and any(token in value.upper() for token in ["POINT", "POLYGON", "MULTIPOLYGON"]):
                     geom = wkt.loads(value)
                 elif isinstance(value, dict):
                     geom = shape(value)
             except Exception:
                 geom = None
+            if geom is not None and not isinstance(geom, Point):
+                try:
+                    geom = geom.representative_point()
+                except Exception:
+                    geom = None
             parsed.append(geom)
-        if any(g is not None for g in parsed):
-            gdf = gpd.GeoDataFrame(df.copy(), geometry=parsed, crs=WGS84).dropna(subset=["geometry"])
-            metric = gdf.to_crs(NYC_LOCAL_CRS)
-            point_geom = metric.geometry.representative_point()
-            gdf = gpd.GeoDataFrame(
-                gdf.drop(columns=["geometry"]), geometry=point_geom, crs=NYC_LOCAL_CRS
-            ).to_crs(WGS84)
-            cleaned = standardize_garden_columns(gdf)
+        df["geometry"] = parsed
+        cleaned = standardize_garden_columns(df.dropna(subset=["geometry"]))
+        if len(cleaned) > 0:
             return cleaned, status
 
-    status["mock"] = "True"
-    status[
-        "message"
-    ] = "Latitude/longitude and geometry were missing or unreadable. Using mock garden points."
+    status.update({"mock": "True", "message": "Latitude/longitude and geometry were missing or unreadable. Using mock garden points."})
     return create_mock_garden_data(), status
 
 
-def standardize_garden_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Create consistent garden_name, borough, status, address fields."""
-    gdf = normalize_columns(gdf)
-    if gdf.crs is None:
-        gdf = gdf.set_crs(WGS84)
-    else:
-        gdf = gdf.to_crs(WGS84)
-
-    name_col = first_existing(
-        gdf,
-        [
-            "gardenname",
-            "garden_name",
-            "name",
-            "site_name",
-            "garden",
-            "park_name",
-            "propertyname",
-        ],
-    )
-    boro_col = first_existing(gdf, ["borough", "boro", "boroname", "boro_name", "county"])
-    status_col = first_existing(gdf, ["status", "garden_status", "active", "open_to_public"])
-    address_col = first_existing(gdf, ["address", "location", "street_address", "cross_streets"])
-    id_col = first_existing(gdf, ["garden_id", "gispropnum", "propid", "objectid", "id"])
-
-    gdf["garden_id"] = gdf[id_col].astype(str) if id_col else [f"G{i:04d}" for i in range(len(gdf))]
-    gdf["garden_name"] = gdf[name_col].astype(str) if name_col else gdf["garden_id"]
-    gdf["borough"] = gdf[boro_col].apply(standardize_borough) if boro_col else None
-    gdf["status"] = gdf[status_col].astype(str).replace({"nan": "Unknown"}) if status_col else "Unknown"
-    gdf["address"] = gdf[address_col].astype(str).replace({"nan": ""}) if address_col else ""
-    gdf["lon"] = gdf.geometry.x
-    gdf["lat"] = gdf.geometry.y
-    if "mock_garden" not in gdf.columns:
-        gdf["mock_garden"] = False
-    return gdf
-
-
-def compute_nta_metrics(
-    garden_points: gpd.GeoDataFrame,
-    nta_boundaries: gpd.GeoDataFrame,
-    population_df: pd.DataFrame,
-) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict[str, str]]:
-    """
-    Spatially join garden points to NTAs and calculate access metrics.
-
-    Metrics:
-        Garden Count by NTA
-        Garden Access Score = gardens per 10,000 residents
-        Garden Density = gardens per square mile
-    """
+def compute_nta_metrics(nta_boundaries: pd.DataFrame, garden_points: pd.DataFrame, population_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str]]:
     status = {"message": "Computed NTA access metrics.", "population_mock": "False"}
-
     nta = nta_boundaries.copy()
     gardens = garden_points.copy()
-    if nta.crs is None:
-        nta = nta.set_crs(WGS84)
-    if gardens.crs is None:
-        gardens = gardens.set_crs(WGS84)
-    nta = nta.to_crs(WGS84)
-    gardens = gardens.to_crs(WGS84)
 
-    # Area calculation in a local projected CRS.
-    try:
-        nta["area_sq_mi"] = nta.to_crs(NYC_LOCAL_CRS).geometry.area / AREA_SQFT_PER_SQMI
-    except Exception:
-        nta["area_sq_mi"] = np.nan
+    nta["area_sq_mi"] = nta["geometry"].apply(approximate_area_sq_mi)
 
-    # Spatial join. Fallback to manual point-in-polygon if spatial index fails.
-    try:
-        joined = gpd.sjoin(
-            gardens[["garden_id", "garden_name", "borough", "status", "geometry"]],
-            nta[["nta_code", "nta_name", "borough", "geometry"]].rename(
-                columns={"borough": "nta_borough"}
-            ),
-            how="left",
-            predicate="within",
-        )
-        counts = joined.groupby("nta_code", dropna=False).size().rename("garden_count")
-    except Exception:
-        nta_lookup = []
-        for _, garden in gardens.iterrows():
-            code = np.nan
-            name = np.nan
-            boro = np.nan
-            for _, area in nta.iterrows():
-                if area.geometry.contains(garden.geometry):
-                    code = area["nta_code"]
-                    name = area["nta_name"]
-                    boro = area["borough"]
+    prepared_areas = []
+    for _, row in nta.iterrows():
+        geom = row["geometry"]
+        if geom is not None:
+            prepared_areas.append((row["nta_code"], row["nta_name"], row["borough"], geom, prep(geom)))
+
+    joined_rows = []
+    for _, garden in gardens.iterrows():
+        found = {"nta_code": np.nan, "nta_name": np.nan, "nta_borough": np.nan}
+        pt = garden["geometry"]
+        for code, name, borough, geom, prepared in prepared_areas:
+            try:
+                if prepared.contains(pt) or geom.intersects(pt):
+                    found = {"nta_code": code, "nta_name": name, "nta_borough": borough}
                     break
-            nta_lookup.append({"nta_code": code, "nta_name": name, "nta_borough": boro})
-        joined = pd.concat([gardens.reset_index(drop=True), pd.DataFrame(nta_lookup)], axis=1)
-        counts = joined.groupby("nta_code", dropna=False).size().rename("garden_count")
-
-    nta = nta.merge(counts, how="left", left_on="nta_code", right_index=True)
-    nta["garden_count"] = nta["garden_count"].fillna(0).astype(int)
-
-    # If garden records lacked borough, assign borough from NTA join when available.
+            except Exception:
+                continue
+        joined_rows.append(found)
+    joined = pd.concat([gardens.reset_index(drop=True), pd.DataFrame(joined_rows)], axis=1)
     if "nta_borough" in joined.columns:
         joined["borough"] = joined["borough"].combine_first(joined["nta_borough"])
 
-    pop = normalize_columns(population_df.copy()) if population_df is not None else pd.DataFrame()
+    counts = joined.dropna(subset=["nta_code"]).groupby("nta_code").size().rename("garden_count")
+    nta = nta.merge(counts, left_on="nta_code", right_index=True, how="left")
+    nta["garden_count"] = nta["garden_count"].fillna(0).astype(int)
+
+    pop = normalize_columns(population_df) if population_df is not None else pd.DataFrame()
     if len(pop) == 0:
         pop = create_mock_population_data(nta)
         status["population_mock"] = "True"
@@ -856,7 +850,6 @@ def compute_nta_metrics(
     if pop_col is None:
         pop = create_mock_population_data(nta)
         pop_code = "nta_code"
-        pop_name = "nta_name"
         pop_col = "population"
         status["population_mock"] = "True"
 
@@ -873,157 +866,72 @@ def compute_nta_metrics(
 
     if nta["population"].isna().mean() > 0.25:
         mock_pop = create_mock_population_data(nta)
-        nta = nta.drop(columns=["population"], errors="ignore").merge(
-            mock_pop[["nta_code", "population"]], on="nta_code", how="left"
-        )
-        status["population_mock"] = "True"
-        status[
-            "message"
-        ] = "Population join was incomplete. Mock placeholders were used for population denominators."
+        nta = nta.drop(columns=["population"], errors="ignore").merge(mock_pop[["nta_code", "population"]], on="nta_code", how="left")
+        status.update({"population_mock": "True", "message": "Population join was incomplete. Mock placeholders were used for population denominators."})
 
     nta["population"] = pd.to_numeric(nta["population"], errors="coerce").fillna(0)
-    nta["garden_access_score"] = np.where(
-        nta["population"] > 0, nta["garden_count"] / nta["population"] * 10_000, 0
-    )
-    nta["garden_density_per_sq_mile"] = np.where(
-        nta["area_sq_mi"] > 0, nta["garden_count"] / nta["area_sq_mi"], 0
-    )
-    nta["access_below_city_median"] = nta["garden_access_score"] < city_median(
-        nta["garden_access_score"]
-    )
+    nta["garden_access_score"] = np.where(nta["population"] > 0, nta["garden_count"] / nta["population"] * 10_000, 0)
+    nta["garden_density_per_sq_mile"] = np.where(nta["area_sq_mi"] > 0, nta["garden_count"] / nta["area_sq_mi"], 0)
+    nta["access_below_city_median"] = nta["garden_access_score"] < city_median(nta["garden_access_score"])
 
-    return nta, gpd.GeoDataFrame(joined, geometry="geometry", crs=WGS84), status
+    return nta, joined, status
 
 
-def prepare_hvi_for_join(hvi_df: pd.DataFrame) -> pd.DataFrame:
-    """Create standardized hvi_rank and possible join keys from raw HVI table."""
-    if hvi_df is None or len(hvi_df) == 0:
-        return pd.DataFrame()
-    hvi = normalize_columns(hvi_df.copy())
-    rank_col = first_existing(
-        hvi,
-        [
-            "hvi_rank",
-            "hvi",
-            "heat_vulnerability_index",
-            "heat_vulnerability",
-            "heat_vulnerability_ranking",
-            "rank",
-            "ranking",
-            "score",
-        ],
-    )
-    if rank_col is None:
-        # Try any column containing hvi or vulnerability that is numeric-like.
-        for c in hvi.columns:
-            if "hvi" in c or "vulner" in c or "rank" in c:
-                converted = pd.to_numeric(hvi[c], errors="coerce")
-                if converted.notna().sum() > 0:
-                    rank_col = c
-                    break
-    if rank_col is None:
-        return pd.DataFrame()
-
-    hvi["hvi_rank"] = pd.to_numeric(hvi[rank_col], errors="coerce")
-    hvi = hvi.dropna(subset=["hvi_rank"]).copy()
-    hvi["hvi_rank"] = hvi["hvi_rank"].clip(1, 5)
-
-    code_col = first_existing(hvi, ["nta_code", "ntacode", "nta2020", "nta", "geoid"])
-    name_col = first_existing(
-        hvi,
-        [
-            "nta_name",
-            "ntaname",
-            "neighborhood",
-            "area_name",
-            "name",
-            "neighborhood_name",
-            "geo_entity_name",
-        ],
-    )
-    boro_col = first_existing(hvi, ["borough", "boro", "boroname", "boro_name"])
-
-    out = hvi.copy()
-    if code_col:
-        out["nta_code"] = out[code_col].astype(str)
-    if name_col:
-        out["nta_name"] = out[name_col].astype(str)
-        out["nta_name_key"] = out["nta_name"].map(normalize_text_key)
-    if boro_col:
-        out["borough"] = out[boro_col].apply(standardize_borough)
-    out["hvi_source"] = f"NYC Open Data {HVI_ID}"
-    return out
-
-
-def classify_priority_areas(
-    nta_metrics: gpd.GeoDataFrame,
-    hvi_df: pd.DataFrame,
-    hvi_threshold: int = 4,
-) -> Tuple[gpd.GeoDataFrame, Dict[str, str]]:
-    """
-    Join HVI rankings to NTA metrics and create priority classification.
-
-    Default matrix:
-        High priority   = HVI >= 4 and access below city median
-        Medium priority = HVI >= 3 and access below city median
-        Lower priority  = all other areas
-    """
-    status = {
-        "hvi_mock": "False",
-        "message": "Joined HVI data to NTA metrics.",
-        "join_method": "none",
-    }
+def classify_priority_areas(nta_metrics: pd.DataFrame, hvi_df: pd.DataFrame, hvi_threshold: int = 4) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    status = {"hvi_mock": "False", "message": "Joined HVI data to NTA metrics.", "join_method": "none"}
     gdf = nta_metrics.copy()
-    hvi = prepare_hvi_for_join(hvi_df)
+    hvi = normalize_columns(hvi_df) if hvi_df is not None else pd.DataFrame()
 
+    joined = False
     if len(hvi) > 0:
-        joined = False
-        if "nta_code" in hvi.columns:
-            hvi_code = hvi[["nta_code", "hvi_rank", "hvi_source"]].drop_duplicates("nta_code")
-            gdf = gdf.merge(hvi_code, on="nta_code", how="left")
-            joined = gdf["hvi_rank"].notna().mean() >= 0.25
-            status["join_method"] = "nta_code"
-        if (not joined) and "nta_name_key" in hvi.columns:
-            gdf = gdf.drop(columns=["hvi_rank", "hvi_source"], errors="ignore")
-            gdf["nta_name_key"] = gdf["nta_name"].map(normalize_text_key)
-            hvi_name = hvi[["nta_name_key", "hvi_rank", "hvi_source"]].drop_duplicates("nta_name_key")
-            gdf = gdf.merge(hvi_name, on="nta_name_key", how="left")
-            joined = gdf["hvi_rank"].notna().mean() >= 0.25
-            status["join_method"] = "nta_name"
+        rank_col = first_existing(hvi, ["hvi_rank", "hvi", "heat_vulnerability_index", "rank", "score"])
+        if rank_col and rank_col != "hvi_rank":
+            hvi["hvi_rank"] = pd.to_numeric(hvi[rank_col], errors="coerce").clip(1, 5)
+        if "hvi_rank" in hvi.columns:
+            hvi["hvi_rank"] = pd.to_numeric(hvi["hvi_rank"], errors="coerce").clip(1, 5)
 
-        if not joined:
-            gdf = gdf.drop(columns=["hvi_rank", "hvi_source"], errors="ignore")
-            mock_hvi = create_mock_hvi_data(gdf)
-            gdf = gdf.merge(mock_hvi[["nta_code", "hvi_rank", "hvi_source"]], on="nta_code", how="left")
-            status["hvi_mock"] = "True"
-            status["join_method"] = "mock_by_nta"
-            status[
-                "message"
-            ] = "HVI data loaded, but join keys did not align sufficiently with NTA boundaries. Mock HVI placeholders were used."
-    else:
-        mock_hvi = create_mock_hvi_data(gdf)
-        gdf = gdf.merge(mock_hvi[["nta_code", "hvi_rank", "hvi_source"]], on="nta_code", how="left")
-        status["hvi_mock"] = "True"
-        status["join_method"] = "mock_by_nta"
-        status["message"] = "HVI data unavailable or unreadable. Mock HVI placeholders were used."
+            if "nta_code" in hvi.columns:
+                tmp = hvi[["nta_code", "hvi_rank", "hvi_source"]].dropna(subset=["hvi_rank"]).drop_duplicates("nta_code")
+                gdf = gdf.merge(tmp, on="nta_code", how="left")
+                joined = gdf["hvi_rank"].notna().mean() >= 0.25
+                status["join_method"] = "nta_code"
+
+            if (not joined) and "cdta_code" in hvi.columns:
+                gdf = gdf.drop(columns=["hvi_rank", "hvi_source"], errors="ignore")
+                gdf["cdta_code"] = gdf["nta_code"].astype(str).str[:4].str.upper()
+                tmp = hvi[["cdta_code", "hvi_rank", "hvi_source"]].dropna(subset=["hvi_rank"]).drop_duplicates("cdta_code")
+                gdf = gdf.merge(tmp, on="cdta_code", how="left")
+                joined = gdf["hvi_rank"].notna().mean() >= 0.25
+                status.update({"join_method": "cdta_proxy", "message": "Joined official CDTA-level HVI to NTAs by parent CDTA code for exploratory proxy mapping."})
+
+            if (not joined) and "nta_name_key" in hvi.columns:
+                gdf = gdf.drop(columns=["hvi_rank", "hvi_source"], errors="ignore")
+                gdf["nta_name_key"] = gdf["nta_name"].map(normalize_text_key)
+                tmp = hvi[["nta_name_key", "hvi_rank", "hvi_source"]].dropna(subset=["hvi_rank"]).drop_duplicates("nta_name_key")
+                gdf = gdf.merge(tmp, on="nta_name_key", how="left")
+                joined = gdf["hvi_rank"].notna().mean() >= 0.25
+                status["join_method"] = "nta_name"
+
+    if not joined:
+        gdf = gdf.drop(columns=["hvi_rank", "hvi_source"], errors="ignore")
+        mock = create_mock_hvi_data(gdf)
+        gdf = gdf.merge(mock[["nta_code", "hvi_rank", "hvi_source"]], on="nta_code", how="left")
+        status.update({"hvi_mock": "True", "join_method": "mock_by_nta", "message": "HVI could not be matched to NTA geography. Mock HVI placeholders were used."})
 
     median_access = city_median(gdf["garden_access_score"])
     gdf["access_below_city_median"] = gdf["garden_access_score"] < median_access
-
     high_cut = int(hvi_threshold)
     medium_cut = max(3, high_cut - 1)
-
-    conditions = [
-        (gdf["hvi_rank"] >= high_cut) & (gdf["access_below_city_median"]),
-        (gdf["hvi_rank"] >= medium_cut) & (gdf["access_below_city_median"]),
-    ]
-    choices = ["High priority", "Medium priority"]
-    gdf["priority_class"] = np.select(conditions, choices, default="Lower priority")
-    gdf["priority_sort"] = gdf["priority_class"].map(
-        {"High priority": 1, "Medium priority": 2, "Lower priority": 3}
+    gdf["priority_class"] = np.select(
+        [
+            (gdf["hvi_rank"] >= high_cut) & (gdf["access_below_city_median"]),
+            (gdf["hvi_rank"] >= medium_cut) & (gdf["access_below_city_median"]),
+        ],
+        ["High priority", "Medium priority"],
+        default="Lower priority",
     )
+    gdf["priority_sort"] = gdf["priority_class"].map({"High priority": 1, "Medium priority": 2, "Lower priority": 3})
     return gdf, status
-
 
 # -----------------------------------------------------------------------------
 # Visualization helpers
@@ -1043,220 +951,212 @@ def render_kpi_card(label: str, value: str, note: str = "") -> None:
     )
 
 
-def render_callout(text: str, warning: bool = False) -> None:
-    klass = "warning-callout" if warning else "callout"
-    st.markdown(f"<div class='{klass}'>{text}</div>", unsafe_allow_html=True)
-
-
-def make_garden_pydeck(gardens: gpd.GeoDataFrame, buffer_miles: float = 0.25) -> pdk.Deck:
-    df = gardens.copy()
-    if len(df) == 0:
-        df = create_mock_garden_data()
-    df["lat"] = df.geometry.y
-    df["lon"] = df.geometry.x
-    radius_m = max(50, float(buffer_miles) * 1609.34)
+def make_garden_pydeck(gardens: pd.DataFrame, buffer_miles: float = 0.25) -> pdk.Deck:
+    data = gardens.copy()
+    if len(data) == 0:
+        data = pd.DataFrame([{"lon": NYC_CENTER["lon"], "lat": NYC_CENTER["lat"], "garden_name": "No gardens in filter", "borough": "", "status": ""}])
+    radius_m = max(55, buffer_miles * 1609.34 * 0.12)
     layer = pdk.Layer(
         "ScatterplotLayer",
-        data=df[["garden_name", "borough", "status", "lat", "lon"]],
+        data=data,
         get_position="[lon, lat]",
         get_radius=radius_m,
-        radius_min_pixels=2,
-        radius_max_pixels=35,
-        get_fill_color=[18, 55, 42, 90],
-        get_line_color=[199, 111, 74, 180],
+        get_fill_color=[14, 51, 39, 170],
+        get_line_color=[255, 255, 255, 220],
         line_width_min_pixels=1,
         pickable=True,
-        auto_highlight=True,
+        opacity=0.88,
     )
-    view = pdk.ViewState(latitude=NYC_CENTER["lat"], longitude=NYC_CENTER["lon"], zoom=9.4)
-    tooltip = {
-        "html": "<b>{garden_name}</b><br/>Borough: {borough}<br/>Status: {status}",
-        "style": {"backgroundColor": "#12372A", "color": "white"},
-    }
+    view = pdk.ViewState(latitude=NYC_CENTER["lat"], longitude=NYC_CENTER["lon"], zoom=9.5, pitch=0)
+    tooltip = {"html": "<b>{garden_name}</b><br/>{borough}<br/>{status}", "style": {"backgroundColor": "#0E3327", "color": "white"}}
     return pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip, map_style="light")
 
 
-def make_choropleth(
-    gdf: gpd.GeoDataFrame,
-    metric: str,
-    title: str,
-    color_scale: str = "YlGn",
-    overlay_points: Optional[gpd.GeoDataFrame] = None,
-) -> go.Figure:
-    plot_gdf = gdf.copy().reset_index(drop=True)
-    if len(plot_gdf) == 0 or metric not in plot_gdf.columns:
-        fig = go.Figure()
-        fig.update_layout(
-            title=f"{title} — no records under current filter",
-            height=420,
-            paper_bgcolor=PALETTE["cream"],
-            plot_bgcolor=PALETTE["cream"],
-            margin={"r": 0, "t": 45, "l": 0, "b": 0},
-        )
-        return fig
-
-    plot_gdf["map_id"] = plot_gdf.index.astype(str)
-    geojson = gdf_to_geojson(plot_gdf)
-
-    hover_data = {
-        "borough": True,
-        "garden_count": True,
-        "garden_access_score": ":.2f",
-        "garden_density_per_sq_mile": ":.2f",
-        "map_id": False,
-    }
-    if "hvi_rank" in plot_gdf.columns:
-        hover_data["hvi_rank"] = True
-    if "priority_class" in plot_gdf.columns:
-        hover_data["priority_class"] = True
-
+def make_metric_choropleth(df: pd.DataFrame, metric: str, title: str) -> go.Figure:
+    geojson = df_to_geojson(df)
+    plot_df = df.copy()
     fig = px.choropleth_mapbox(
-        plot_gdf,
+        plot_df,
         geojson=geojson,
-        locations="map_id",
-        featureidkey="properties.map_id",
+        locations="nta_code",
+        featureidkey="properties.nta_code",
         color=metric,
         hover_name="nta_name",
-        hover_data=hover_data,
-        color_continuous_scale=color_scale,
+        hover_data={
+            "borough": True,
+            "garden_count": True,
+            "population": ":,.0f",
+            "garden_access_score": ":.2f",
+            "garden_density_per_sq_mile": ":.2f",
+            "hvi_rank": True if "hvi_rank" in plot_df.columns else False,
+            "nta_code": False,
+        },
+        color_continuous_scale="YlGn",
         mapbox_style="carto-positron",
-        center=NYC_CENTER,
-        zoom=9.15,
-        opacity=0.68,
+        center={"lat": NYC_CENTER["lat"], "lon": NYC_CENTER["lon"]},
+        zoom=9.35,
+        opacity=0.72,
         title=title,
     )
-
-    if overlay_points is not None and len(overlay_points) > 0:
-        points = overlay_points.to_crs(WGS84).copy()
-        points["lat"] = points.geometry.y
-        points["lon"] = points.geometry.x
-        fig.add_trace(
-            go.Scattermapbox(
-                lat=points["lat"],
-                lon=points["lon"],
-                mode="markers",
-                marker={"size": 6, "color": PALETTE["forest"], "opacity": 0.72},
-                text=points.get("garden_name", "Community garden"),
-                hovertemplate="<b>%{text}</b><extra></extra>",
-                name="Community gardens",
-            )
-        )
-
     fig.update_layout(
-        margin={"r": 0, "t": 45, "l": 0, "b": 0},
-        height=610,
+        height=640,
+        margin={"r": 0, "t": 48, "l": 0, "b": 0},
         paper_bgcolor=PALETTE["cream"],
         plot_bgcolor=PALETTE["cream"],
-        legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.01),
+        font={"color": PALETTE["ink"]},
+        coloraxis_colorbar={"title": friendly_metric_name(metric)},
     )
     return fig
 
 
-def priority_download_df(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-    cols = [
-        "priority_class",
-        "borough",
-        "nta_code",
-        "nta_name",
-        "hvi_rank",
-        "garden_count",
-        "population",
-        "garden_access_score",
-        "garden_density_per_sq_mile",
-    ]
-    available = [c for c in cols if c in gdf.columns]
-    return gdf[available].sort_values(["priority_class", "garden_access_score", "hvi_rank"]).copy()
+def make_priority_map(df: pd.DataFrame, gardens: pd.DataFrame) -> go.Figure:
+    geojson = df_to_geojson(df)
+    priority_colors = {"High priority": 3, "Medium priority": 2, "Lower priority": 1}
+    plot_df = df.copy()
+    plot_df["priority_numeric"] = plot_df["priority_class"].map(priority_colors)
+    fig = px.choropleth_mapbox(
+        plot_df,
+        geojson=geojson,
+        locations="nta_code",
+        featureidkey="properties.nta_code",
+        color="priority_numeric",
+        hover_name="nta_name",
+        hover_data={
+            "borough": True,
+            "priority_class": True,
+            "hvi_rank": True,
+            "garden_access_score": ":.2f",
+            "garden_count": True,
+            "nta_code": False,
+            "priority_numeric": False,
+        },
+        color_continuous_scale=[
+            [0.0, "#E8EFE2"],
+            [0.49, "#E8EFE2"],
+            [0.50, "#F4C999"],
+            [0.74, "#F4C999"],
+            [0.75, "#B85C38"],
+            [1.0, "#B85C38"],
+        ],
+        mapbox_style="carto-positron",
+        center={"lat": NYC_CENTER["lat"], "lon": NYC_CENTER["lon"]},
+        zoom=9.35,
+        opacity=0.74,
+        title="Priority map: heat vulnerability + low garden access",
+    )
+    if len(gardens) > 0:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=gardens["lat"],
+                lon=gardens["lon"],
+                mode="markers",
+                marker={"size": 6, "color": PALETTE["forest"], "opacity": 0.72},
+                text=gardens["garden_name"],
+                name="Community gardens",
+                hovertemplate="<b>%{text}</b><extra></extra>",
+            )
+        )
+    fig.update_layout(
+        height=660,
+        margin={"r": 0, "t": 48, "l": 0, "b": 0},
+        paper_bgcolor=PALETTE["cream"],
+        plot_bgcolor=PALETTE["cream"],
+        font={"color": PALETTE["ink"]},
+        coloraxis_showscale=False,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 0.01, "xanchor": "left", "x": 0.01},
+    )
+    return fig
 
+
+def render_data_factors() -> None:
+    st.markdown("### What exactly goes into each dataset")
+    st.dataframe(pd.DataFrame(DATASET_FACTORS), use_container_width=True, hide_index=True)
+    st.markdown("#### Heat Vulnerability Index factors")
+    st.dataframe(pd.DataFrame(HVI_FACTOR_ROWS), use_container_width=True, hide_index=True)
+    st.markdown(
+        """
+        <div class="warning-callout">
+        <strong>Important interpretation note:</strong> HVI is an index, not a direct medical outcome measure. 
+        This dashboard uses it for exploratory priority mapping with community garden access, not for causal claims.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # -----------------------------------------------------------------------------
 # App data pipeline
 # -----------------------------------------------------------------------------
 
-
-with st.spinner("Loading NYC Open Data and building resilience metrics..."):
-    raw_gardens, greenthumb_status = load_greenthumb_data()
-    nta_boundaries, nta_status = load_nta_boundaries()
-    hvi_raw, hvi_load_status = load_hvi_data()
-    population_raw, population_status = load_population_data(nta_boundaries)
-    gardens, garden_clean_status = clean_garden_points(raw_gardens)
-    nta_metrics, garden_joined, metrics_status = compute_nta_metrics(
-        gardens, nta_boundaries, population_raw
-    )
-    priority_gdf, hvi_join_status = classify_priority_areas(nta_metrics, hvi_raw, hvi_threshold=4)
-
-# Use spatially derived borough for gardens when raw garden borough is missing.
-if "nta_borough" in garden_joined.columns:
-    gardens = garden_joined.copy()
-    if "borough" not in gardens.columns:
-        gardens["borough"] = gardens["nta_borough"]
-    else:
-        gardens["borough"] = gardens["borough"].combine_first(gardens["nta_borough"])
-    gardens["lat"] = gardens.geometry.y
-    gardens["lon"] = gardens.geometry.x
+with st.spinner("Loading NYC garden, boundary, population, and heat-vulnerability data..."):
+    raw_gardens, garden_load_status = load_greenthumb_data()
+    nta_boundaries, nta_load_status = load_nta_boundaries()
+    garden_points, garden_clean_status = clean_garden_points(raw_gardens)
+    population_df, population_status = load_population_data(nta_boundaries)
+    nta_metrics, garden_joined, metrics_status = compute_nta_metrics(nta_boundaries, garden_points, population_df)
+    hvi_df, hvi_status = load_hvi_data()
 
 # -----------------------------------------------------------------------------
-# Header and sidebar
+# Sidebar controls
 # -----------------------------------------------------------------------------
 
-st.markdown(
-    "<div class='main-title'>NYC Community Gardens for Equitable Climate Resilience</div>",
-    unsafe_allow_html=True,
+st.sidebar.markdown("## Dashboard controls")
+borough = st.sidebar.selectbox("Borough filter", get_borough_options(garden_points), index=0)
+metric_view = st.sidebar.selectbox(
+    "Metric view",
+    ["garden_access_score", "garden_count", "garden_density_per_sq_mile"],
+    format_func=friendly_metric_name,
 )
+buffer_distance = st.sidebar.slider("Visual garden buffer distance", 0.10, 1.00, 0.25, 0.05)
+hvi_threshold = st.sidebar.slider("High HVI threshold", 3, 5, 4, 1)
+
+priority_gdf, priority_status = classify_priority_areas(nta_metrics, hvi_df, hvi_threshold=hvi_threshold)
+
+filtered_gardens = filtered_by_borough(garden_points, borough)
+filtered_nta = filtered_by_borough(priority_gdf, borough)
+filtered_joined = filtered_by_borough(garden_joined, borough)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Data quality")
+mock_flags = [
+    garden_load_status.get("mock") == "True",
+    garden_clean_status.get("mock") == "True",
+    nta_load_status.get("mock") == "True",
+    population_status.get("mock") == "True" or metrics_status.get("population_mock") == "True",
+    hvi_status.get("mock") == "True" or priority_status.get("hvi_mock") == "True",
+]
+st.sidebar.caption("🟢 Official/local data loaded" if not any(mock_flags) else "🟠 Some fallback/proxy data in use")
+st.sidebar.caption(f"Gardens: {garden_load_status.get('source')}")
+st.sidebar.caption(f"Population: {population_status.get('source')}")
+st.sidebar.caption(f"HVI: {hvi_status.get('source')} / {priority_status.get('join_method')}")
+
+# -----------------------------------------------------------------------------
+# Header
+# -----------------------------------------------------------------------------
+
+st.markdown("<div class='eyebrow'>Civic-tech geospatial dashboard · SDG 11 · SDG 13 · SDG 15</div>", unsafe_allow_html=True)
+st.markdown("<div class='main-title'>NYC Community Gardens for Equitable Climate Resilience</div>", unsafe_allow_html=True)
 st.markdown(
     "<div class='guiding-question'>How can NYC community gardens support sustainable, equitable, and climate-resilient cities?</div>",
     unsafe_allow_html=True,
 )
 st.markdown(
-    "<div class='subtle'>A youth-friendly civic-tech dashboard connecting community gardens to SDG 11, SDG 13, SDG 15, and supporting SDG 2 and SDG 3.</div>",
+    """
+    <div class="callout">
+    This dashboard treats NYC community gardens as small-scale urban resilience infrastructure: public-space access, 
+    heat-risk awareness, biodiversity, food education, and youth-led community action.
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
-st.sidebar.markdown("## Global filters")
-borough_choice = st.sidebar.selectbox("Borough", get_borough_options(priority_gdf), index=0)
-metric_view = st.sidebar.selectbox(
-    "Metric view",
-    ["garden_access_score", "garden_density_per_sq_mile", "garden_count"],
-    format_func=friendly_metric_name,
-    index=0,
-)
-buffer_distance = st.sidebar.slider(
-    "Garden influence buffer / visual radius", min_value=0.10, max_value=1.00, value=0.25, step=0.05
-)
-hvi_threshold = st.sidebar.slider("High HVI threshold", min_value=1, max_value=5, value=4, step=1)
-
-# Reclassify if user changes threshold.
-priority_gdf, hvi_join_status = classify_priority_areas(nta_metrics, hvi_raw, hvi_threshold=hvi_threshold)
-
-filtered_gardens = filtered_by_borough(gardens, borough_choice)
-filtered_priority = filtered_by_borough(priority_gdf, borough_choice)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("## Data status")
-for label, status in [
-    ("Gardens", greenthumb_status),
-    ("NTA boundaries", nta_status),
-    ("Population", population_status),
-    ("HVI", hvi_join_status),
-]:
-    mock = status.get("mock", status.get("hvi_mock", "False"))
-    icon = "⚠️" if str(mock) == "True" else "✅"
-    st.sidebar.caption(f"{icon} {label}: {status.get('source', status.get('join_method', 'loaded'))}")
-
-mock_flags = [
-    greenthumb_status.get("mock") == "True",
-    nta_status.get("mock") == "True",
-    population_status.get("mock") == "True",
-    hvi_join_status.get("hvi_mock") == "True",
-]
 if any(mock_flags):
-    render_callout(
-        "<strong>Demo caveat:</strong> One or more live data layers could not be joined or loaded and a mock fallback is being used. Replace mock population with a clean 2020 NTA population CSV before formal policy interpretation.",
-        warning=True,
-    )
-else:
-    render_callout(
-        "<strong>Exploratory dashboard:</strong> This tool uses official NYC open data layers where available, but the analysis is designed for education and prioritization, not causal health claims.",
-        warning=False,
+    st.markdown(
+        """
+        <div class="warning-callout">
+        <strong>Data note:</strong> One or more layers are using fallback or proxy data. Use this as an education/prototype view, not a final policy estimate.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 # -----------------------------------------------------------------------------
@@ -1265,293 +1165,199 @@ else:
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
-        "1. Gardens Overview",
-        "2. Access & Equity Map",
-        "3. Climate Resilience Layer",
-        "4. SDG Lens",
-        "5. Youth Action & Recommendations",
+        "1 · Overview",
+        "2 · Access & Equity",
+        "3 · Climate Resilience",
+        "4 · SDG + Data Factors",
+        "5 · Youth Action",
     ]
 )
 
-# -----------------------------------------------------------------------------
-# Tab 1: Overview
-# -----------------------------------------------------------------------------
-
 with tab1:
     st.subheader("NYC Community Gardens Overview")
-
-    total_gardens = len(filtered_gardens)
-    borough_count = (
-        filtered_gardens["borough"].nunique(dropna=True) if "borough" in filtered_gardens.columns else 0
-    )
-    nta_with_gardens = int((filtered_priority["garden_count"] > 0).sum())
-    active_share = None
-    if "status" in filtered_gardens.columns and total_gardens > 0:
-        active_share = (
-            filtered_gardens["status"].astype(str).str.contains("active|open", case=False, na=False).mean()
-            * 100
-        )
-
     c1, c2, c3, c4 = st.columns(4)
+    total_gardens = len(filtered_gardens)
+    borough_count = filtered_gardens["borough"].nunique() if "borough" in filtered_gardens else 0
+    active_share = np.nan
+    if "status" in filtered_gardens and len(filtered_gardens) > 0:
+        active_share = filtered_gardens["status"].astype(str).str.contains("active|license|open", case=False, regex=True).mean() * 100
+    nta_with_gardens = int((filtered_nta["garden_count"] > 0).sum()) if len(filtered_nta) else 0
     with c1:
-        render_kpi_card("Total gardens", f"{total_gardens:,}", f"Filtered: {borough_choice}")
+        render_kpi_card("Total gardens", f"{total_gardens:,}", "Filtered garden points")
     with c2:
-        render_kpi_card("Boroughs represented", f"{borough_count}", "Based on available borough field/spatial join")
+        render_kpi_card("Boroughs represented", f"{borough_count:,}", "Current selection")
     with c3:
-        render_kpi_card("NTAs with ≥1 garden", f"{nta_with_gardens:,}", "Spatially joined to 2020 NTAs")
+        render_kpi_card("Active/status share", "—" if pd.isna(active_share) else f"{active_share:.0f}%", "Based on available status text")
     with c4:
-        render_kpi_card(
-            "Active/open share",
-            "N/A" if active_share is None else f"{active_share:.0f}%",
-            "Only if status field is available",
-        )
+        render_kpi_card("NTAs with gardens", f"{nta_with_gardens:,}", "Neighborhoods containing ≥1 garden")
 
-    render_callout(
-        "Community gardens are distributed unevenly across NYC, creating an opportunity to examine access and equity."
+    st.pydeck_chart(make_garden_pydeck(filtered_gardens, buffer_miles=buffer_distance), use_container_width=True)
+    st.markdown(
+        """
+        <div class="callout">
+        <strong>Interpretation:</strong> Community gardens are distributed unevenly across NYC, creating an opportunity to examine access, equity, and climate resilience together.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    st.pydeck_chart(make_garden_pydeck(filtered_gardens, buffer_distance), use_container_width=True)
-    st.caption(
-        f"The visual radius is set to {buffer_distance:.2f} miles. It is a communication aid, not a verified walking-network service area."
-    )
-
-    if "status" in filtered_gardens.columns and total_gardens > 0:
-        status_counts = (
-            filtered_gardens["status"].astype(str).replace("nan", "Unknown").value_counts().head(12)
-        )
-        if len(status_counts) > 1:
-            fig_status = px.bar(
-                status_counts.reset_index(),
-                x="status",
-                y="count",
-                labels={"status": "Status", "count": "Garden count"},
-                title="Status split, if available",
-            )
-            fig_status.update_layout(height=340, paper_bgcolor=PALETTE["cream"], plot_bgcolor="white")
-            st.plotly_chart(fig_status, use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# Tab 2: Access and equity
-# -----------------------------------------------------------------------------
+    if len(filtered_gardens) > 0:
+        status_counts = filtered_gardens["status"].fillna("Unknown").astype(str).value_counts().head(12).reset_index()
+        status_counts.columns = ["status", "count"]
+        fig_status = px.bar(status_counts, x="status", y="count", title="Garden status split, if available")
+        fig_status.update_layout(height=340, paper_bgcolor=PALETTE["cream"], plot_bgcolor=PALETTE["white"], font={"color": PALETTE["ink"]})
+        st.plotly_chart(fig_status, use_container_width=True)
 
 with tab2:
     st.subheader("Access & Equity Map")
-
-    render_callout(
-        "<strong>Caveat:</strong> Population denominators, boundary years, and neighborhood definitions affect interpretation. Use this view to identify questions for deeper community validation, not to rank neighborhoods permanently.",
-        warning=True,
+    st.markdown(
+        """
+        <span class="metric-pill">Garden Count by NTA</span>
+        <span class="metric-pill">Garden Access Score = gardens per 10,000 residents</span>
+        <span class="metric-pill">Garden Density = gardens per square mile</span>
+        """,
+        unsafe_allow_html=True,
     )
-
-    map_metric = metric_view
-    fig = make_choropleth(
-        filtered_priority,
-        map_metric,
-        f"NTA choropleth by {friendly_metric_name(map_metric)}",
-        color_scale="YlGn",
-        overlay_points=None,
+    st.plotly_chart(
+        make_metric_choropleth(filtered_nta, metric_view, f"NTA choropleth: {friendly_metric_name(metric_view)}"),
+        use_container_width=True,
     )
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Median access score", f"{city_median(filtered_priority['garden_access_score']):.2f}")
-    with c2:
-        st.metric("NTAs below city median", f"{int(filtered_priority['access_below_city_median'].sum()):,}")
-    with c3:
-        st.metric("Zero-garden NTAs", f"{int((filtered_priority['garden_count'] == 0).sum()):,}")
-
-    st.markdown("### Bottom 10 NTAs by garden access score")
-    bottom_cols = [
-        "borough",
-        "nta_code",
-        "nta_name",
-        "population",
-        "garden_count",
-        "garden_access_score",
-        "garden_density_per_sq_mile",
-    ]
+    st.markdown(
+        """
+        <div class="warning-callout">
+        <strong>Caveat:</strong> Population denominators and boundary definitions affect interpretation. A low access score can mean few gardens, high population, or both.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    bottom = filtered_nta.sort_values(["garden_access_score", "garden_count"], ascending=[True, True]).head(10)
+    st.markdown("#### Bottom 10 NTAs by garden access score")
     st.dataframe(
-        filtered_priority[bottom_cols]
-        .sort_values(["garden_access_score", "garden_count", "population"], ascending=[True, True, False])
-        .head(10)
-        .style.format(
-            {
-                "population": "{:,.0f}",
-                "garden_access_score": "{:.2f}",
-                "garden_density_per_sq_mile": "{:.2f}",
+        bottom[["nta_code", "nta_name", "borough", "population", "garden_count", "garden_access_score", "garden_density_per_sq_mile"]].rename(
+            columns={
+                "nta_code": "NTA Code",
+                "nta_name": "NTA Name",
+                "borough": "Borough",
+                "population": "Population",
+                "garden_count": "Garden Count",
+                "garden_access_score": "Gardens per 10k Residents",
+                "garden_density_per_sq_mile": "Gardens per Sq Mile",
             }
         ),
         use_container_width=True,
         hide_index=True,
     )
 
-# -----------------------------------------------------------------------------
-# Tab 3: Climate resilience
-# -----------------------------------------------------------------------------
-
 with tab3:
     st.subheader("Climate Resilience Layer")
-
-    render_callout(
-        "<strong>Exploratory Analysis/Priority Mapping Only:</strong> This matrix explores structural correlations, not direct causal health outcomes.",
-        warning=True,
+    st.markdown(
+        """
+        <div class="warning-callout">
+        <strong>Exploratory Analysis/Priority Mapping Only:</strong> This matrix explores structural correlations, not direct causal health outcomes.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    render_callout(
-        "Neighborhoods with high heat vulnerability and low community garden access represent priority areas for youth-led sustainability education."
+    st.plotly_chart(make_priority_map(filtered_nta, filtered_gardens), use_container_width=True)
+    high = filtered_nta[filtered_nta["priority_class"] == "High priority"]
+    medium = filtered_nta[filtered_nta["priority_class"] == "Medium priority"]
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        render_kpi_card("High priority NTAs", f"{len(high):,}", f"HVI ≥ {hvi_threshold} + below-median access")
+    with col2:
+        render_kpi_card("Medium priority NTAs", f"{len(medium):,}", "Moderate/high HVI + below-median access")
+    with col3:
+        render_kpi_card("Median access score", format_num(city_median(filtered_nta["garden_access_score"]), 2), "Gardens per 10,000 residents")
+    st.markdown(
+        """
+        <div class="callout">
+        <strong>Insight:</strong> Neighborhoods with high heat vulnerability and low community garden access represent priority areas for youth-led sustainability education.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-
-    fig_hvi = make_choropleth(
-        filtered_priority,
-        "hvi_rank",
-        "Heat Vulnerability Index with community garden overlay",
-        color_scale="OrRd",
-        overlay_points=filtered_gardens,
-    )
-    st.plotly_chart(fig_hvi, use_container_width=True)
-
-    st.markdown("### Priority classification")
-    p1, p2, p3 = st.columns(3)
-    counts = filtered_priority["priority_class"].value_counts()
-    with p1:
-        st.metric("High priority", f"{int(counts.get('High priority', 0)):,}")
-    with p2:
-        st.metric("Medium priority", f"{int(counts.get('Medium priority', 0)):,}")
-    with p3:
-        st.metric("Lower priority", f"{int(counts.get('Lower priority', 0)):,}")
-
-    priority_table_cols = [
-        "priority_class",
-        "borough",
-        "nta_name",
-        "hvi_rank",
-        "garden_count",
-        "garden_access_score",
-        "population",
-    ]
+    priority_table = filtered_nta.sort_values(["priority_sort", "hvi_rank", "garden_access_score"], ascending=[True, False, True])
     st.dataframe(
-        filtered_priority[priority_table_cols]
-        .sort_values(["priority_sort", "garden_access_score", "hvi_rank"], ascending=[True, True, False])
-        .head(15)
-        .style.format({"garden_access_score": "{:.2f}", "population": "{:,.0f}"}),
+        priority_table[["nta_code", "nta_name", "borough", "priority_class", "hvi_rank", "garden_access_score", "garden_count", "population"]].rename(
+            columns={
+                "nta_code": "NTA Code",
+                "nta_name": "NTA Name",
+                "borough": "Borough",
+                "priority_class": "Priority",
+                "hvi_rank": "HVI Rank",
+                "garden_access_score": "Gardens per 10k Residents",
+                "garden_count": "Garden Count",
+                "population": "Population",
+            }
+        ),
         use_container_width=True,
         hide_index=True,
     )
 
-# -----------------------------------------------------------------------------
-# Tab 4: SDG lens
-# -----------------------------------------------------------------------------
-
 with tab4:
-    st.subheader("SDG Lens")
-    st.markdown(
-        "Community gardens are small spaces, but they connect multiple SDGs when they are treated as learning, resilience, and neighborhood partnership infrastructure."
-    )
-
+    st.subheader("SDG Lens + Data Factor Transparency")
     sdgs = [
-        {
-            "sdg": "SDG 11",
-            "title": "Sustainable Cities and Communities",
-            "badge": "Inclusive public space",
-            "text": "Gardens can improve neighborhood access to safe, welcoming green spaces and give residents a visible place to organize around local resilience.",
-        },
-        {
-            "sdg": "SDG 13",
-            "title": "Climate Action",
-            "badge": "Heat awareness",
-            "text": "Gardens can support climate adaptation education by helping students connect extreme heat, shade, soil, and local preparedness.",
-        },
-        {
-            "sdg": "SDG 15",
-            "title": "Life on Land",
-            "badge": "Urban biodiversity",
-            "text": "Gardens create small habitats for plants, pollinators, and soil life, making biodiversity visible in dense urban neighborhoods.",
-        },
-        {
-            "sdg": "SDG 2",
-            "title": "Zero Hunger",
-            "badge": "Food education",
-            "text": "Even when gardens do not solve food insecurity alone, they can teach food systems, nutrition, composting, and community food justice.",
-        },
-        {
-            "sdg": "SDG 3",
-            "title": "Good Health and Well-being",
-            "badge": "Outdoor wellness",
-            "text": "Gardens can support outdoor learning, social connection, stress reduction, and youth-led community health conversations.",
-        },
+        {"sdg": "SDG 11", "title": "Sustainable Cities", "badge": "Inclusive public space", "body": "Gardens can improve neighborhood access to safe, local, community-managed green space."},
+        {"sdg": "SDG 13", "title": "Climate Action", "badge": "Heat adaptation", "body": "Garden maps help students connect heat vulnerability to local adaptation and awareness."},
+        {"sdg": "SDG 15", "title": "Life on Land", "badge": "Urban biodiversity", "body": "Community gardens can support pollinators, habitat, soil learning, and ecological stewardship."},
+        {"sdg": "SDG 2", "title": "Zero Hunger", "badge": "Food education", "body": "Gardens can teach food systems, nutrition, and community-based food security."},
+        {"sdg": "SDG 3", "title": "Good Health", "badge": "Wellness and learning", "body": "Outdoor learning and community care can support wellness, belonging, and health awareness."},
     ]
-
-    row1 = st.columns(3)
-    row2 = st.columns(2)
-    slots = row1 + row2
-    for slot, item in zip(slots, sdgs):
-        with slot:
+    cols = st.columns(3)
+    for i, item in enumerate(sdgs):
+        with cols[i % 3]:
             st.markdown(
                 f"""
-                <div class='sdg-card'>
-                    <span class='badge'>{item['sdg']}</span>
-                    <h4 style='color:{PALETTE['forest']}; margin-top:.55rem'>{item['title']}</h4>
-                    <strong style='color:{PALETTE['terracotta']}'>{item['badge']}</strong>
-                    <p style='margin-top:.55rem'>{item['text']}</p>
+                <div class="sdg-card">
+                    <span class="badge">{item['sdg']}</span>
+                    <h4 style="color:{PALETTE['forest']}; margin:.6rem 0 .25rem 0;">{item['title']}</h4>
+                    <strong style="color:{PALETTE['terracotta']};">{item['badge']}</strong>
+                    <p class="subtle" style="margin-top:.55rem;">{item['body']}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-
-# -----------------------------------------------------------------------------
-# Tab 5: Youth action and recommendations
-# -----------------------------------------------------------------------------
+    st.markdown("---")
+    render_data_factors()
 
 with tab5:
     st.subheader("Youth Action & Recommendations")
-
-    priority_for_action = filtered_priority.sort_values(
-        ["priority_sort", "garden_access_score", "hvi_rank"], ascending=[True, True, False]
-    ).copy()
-    top_priority = priority_for_action.head(5)
-
+    priority_for_actions = filtered_nta[filtered_nta["priority_class"].isin(["High priority", "Medium priority"])].sort_values(
+        ["priority_sort", "hvi_rank", "garden_access_score"], ascending=[True, False, True]
+    )
+    top_names = priority_for_actions["nta_name"].head(5).tolist()
+    adopt_text = ", ".join(top_names) if top_names else "No priority neighborhoods in the current filter"
     a1, a2 = st.columns(2)
     with a1:
         st.markdown(
-            """
-            <div class='action-card'>
-                <h4>1. What students can learn</h4>
-                <ul>
-                    <li>How heat vulnerability, green space, and public health are connected.</li>
-                    <li>How to read maps critically and ask what data may be missing.</li>
-                    <li>How community-led spaces can become climate education infrastructure.</li>
-                </ul>
+            f"""
+            <div class="action-card">
+            <span class="badge">1</span>
+            <h4>What students can learn</h4>
+            <p>How open data connects public space, population, heat vulnerability, and SDG action. Students can compare garden access across neighborhoods and ask why patterns differ.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
     with a2:
-        neighborhoods = "".join(
-            f"<li><strong>{row.nta_name}</strong> — {row.borough}, HVI {row.hvi_rank:.0f}, access {row.garden_access_score:.2f}</li>"
-            for _, row in top_priority.iterrows()
-        )
-        if not neighborhoods:
-            neighborhoods = "<li>No priority neighborhoods available under the current filter.</li>"
         st.markdown(
             f"""
-            <div class='action-card'>
-                <h4>2. Priority neighborhoods to adopt</h4>
-                <ul>{neighborhoods}</ul>
+            <div class="action-card">
+            <span class="badge">2</span>
+            <h4>Priority neighborhoods to adopt</h4>
+            <p>{adopt_text}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-
     b1, b2 = st.columns(2)
     with b1:
         st.markdown(
             """
-            <div class='action-card'>
-                <h4>3. SDG action ideas</h4>
-                <ul>
-                    <li>Create a student-made heat and garden awareness map.</li>
-                    <li>Design a pollinator, composting, or shade-learning station.</li>
-                    <li>Host a one-day SDG garden walk connecting SDG 11, 13, 15, 2, and 3.</li>
-                </ul>
+            <div class="action-card">
+            <span class="badge">3</span>
+            <h4>SDG action ideas</h4>
+            <p>Run a garden-access walk audit, design heat-safety posters, map shade and cooling resources, interview gardeners, and create a youth SDG story map.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1559,67 +1365,61 @@ with tab5:
     with b2:
         st.markdown(
             """
-            <div class='action-card'>
-                <h4>4. Community partnership ideas</h4>
-                <ul>
-                    <li>Partner with GreenThumb garden groups for local storytelling.</li>
-                    <li>Invite public health, urban planning, and school sustainability mentors.</li>
-                    <li>Share findings with neighborhood councils or youth climate clubs.</li>
-                </ul>
+            <div class="action-card">
+            <span class="badge">4</span>
+            <h4>Community partnership ideas</h4>
+            <p>Partner with GreenThumb garden groups, local schools, libraries, senior centers, youth climate clubs, and neighborhood health organizations.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    st.markdown("### Download priority neighborhoods")
-    download_df = priority_download_df(priority_for_action)
+    download_cols = ["nta_code", "nta_name", "borough", "priority_class", "hvi_rank", "garden_access_score", "garden_count", "population"]
+    csv = priority_for_actions[download_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download priority neighborhoods CSV",
-        data=download_df.to_csv(index=False).encode("utf-8"),
-        file_name="nyc_garden_priority_neighborhoods.csv",
+        "Download priority neighborhoods CSV",
+        csv,
+        file_name="nyc_garden_heat_priority_neighborhoods.csv",
         mime="text/csv",
     )
 
-    presenter_script = f"""
-Hello, my dashboard asks one question: How can NYC community gardens support sustainable, equitable, and climate-resilient cities?
-I treat community gardens as small-scale urban resilience infrastructure. First, the dashboard maps where gardens are located across New York City. Then it connects those garden locations to Neighborhood Tabulation Areas, population denominators, and heat vulnerability.
-The key insight is not just how many gardens exist, but where access is lower and climate risk is higher. In this dashboard, high-priority neighborhoods are places where heat vulnerability is high and garden access is below the city median. That makes them strong candidates for youth-led sustainability education, garden partnerships, and SDG action.
-This is exploratory priority mapping, not a causal health study. But it helps students ask better civic questions: Who has access to green space? Which neighborhoods face greater climate stress? And how can young people turn local gardens into learning spaces for SDG 11, climate action, biodiversity, food education, and community well-being?
-""".strip()
-
-    st.markdown("### 60-second presenter script")
-    st.text_area("Presenter script", value=presenter_script, height=230)
+    st.markdown("#### 60-second presenter script")
+    st.text_area(
+        "Presenter script",
+        value=(
+            "Hello, my dashboard asks one question: How can NYC community gardens support sustainable, equitable, and climate-resilient cities? "
+            "I treat community gardens as small-scale urban resilience infrastructure, not just as nice green spaces. "
+            "First, I map where gardens are located across New York City. Then I connect those garden points to neighborhood boundaries and population data to calculate access: gardens per 10,000 residents. "
+            "Next, I compare access with heat vulnerability. Neighborhoods with high heat vulnerability and low garden access become priority areas for youth-led SDG education. "
+            "This is not a causal health study; it is an exploratory priority map. The goal is to help students ask better civic questions, identify neighborhoods for partnership, and connect local action to SDG 11, SDG 13, SDG 15, SDG 2, and SDG 3."
+        ),
+        height=190,
+    )
 
 # -----------------------------------------------------------------------------
-# Footer: data caveats and sources
+# Footer: caveats and sources
 # -----------------------------------------------------------------------------
 
-st.markdown("---")
-with st.expander("Data caveats and source notes", expanded=False):
+with st.expander("Data caveats, source notes, and loading status", expanded=False):
     st.markdown(
-        f"""
-        **Primary official NYC data IDs used in this app**
-        - GreenThumb Garden Info: `{GREENTHUMB_ID}`
-        - 2020 Neighborhood Tabulation Areas: `{NTA_ID}`
-        - Heat Vulnerability Index Rankings: `{HVI_ID}`
-
-        **Key caveats**
-        1. This dashboard is exploratory and educational. It does not estimate causal effects of gardens on heat illness, health outcomes, or food security.
-        2. Population denominators strongly affect access scores. For production use, replace the placeholder with a clean 2020 NTA population file at `data/nta_population.csv`.
-        3. HVI geography and NTA geography may not share a perfect join key. The code attempts code/name joins and clearly falls back to mock HVI when the match is weak.
-        4. Garden access is approximated using point-in-polygon counts, not walking-network distance, garden opening hours, accessibility, capacity, or program quality.
-        5. The visual buffer radius is for communication only. A formal access analysis should use pedestrian network travel time and entrance points.
-        6. NTA boundaries are statistical geographies; they may not match residents' lived neighborhood identities.
+        """
+        **Core caveats**
+        - This is an exploratory civic-tech dashboard, not a causal health-outcome study.
+        - Garden access is based on point-in-polygon assignment to NTAs, not walking network travel time.
+        - Population denominator choice changes the access score.
+        - HVI may use a CDTA-to-NTA proxy when a direct NTA-level HVI table is unavailable.
+        - Garden status, entrance availability, hours, program quality, and capacity are not fully represented.
         """
     )
-    st.json(
-        {
-            "greenthumb_status": greenthumb_status,
-            "garden_clean_status": garden_clean_status,
-            "nta_status": nta_status,
-            "population_status": population_status,
-            "metrics_status": metrics_status,
-            "hvi_load_status": hvi_load_status,
-            "hvi_join_status": hvi_join_status,
-        }
+    status_df = pd.DataFrame(
+        [
+            garden_load_status,
+            {"dataset": "Garden point cleaning", "dataset_id": "derived", "source": "app logic", "mock": garden_clean_status.get("mock"), "message": garden_clean_status.get("message")},
+            nta_load_status,
+            population_status,
+            hvi_status,
+            {"dataset": "Priority classification", "dataset_id": "derived", "source": priority_status.get("join_method"), "mock": priority_status.get("hvi_mock"), "message": priority_status.get("message")},
+        ]
     )
+    st.dataframe(status_df, use_container_width=True, hide_index=True)
+    render_data_factors()

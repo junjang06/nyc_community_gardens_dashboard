@@ -56,6 +56,10 @@ st.set_page_config(
 GREENTHUMB_ID = "p78i-pat6"
 NTA_ID = "9nt8-h7nd"
 HVI_ID = "4mhf-duep"
+HVI_CDTA_ARCGIS_URL = (
+    "https://services1.arcgis.com/8cuieNI8NbqQZQVJ/ArcGIS/rest/services/"
+    "HVI_by_CDTA_CRAD_2024/FeatureServer/0/query"
+)
 
 SODA_JSON = "https://data.cityofnewyork.us/resource/{dataset_id}.json?$limit=50000"
 SODA_GEOJSON = "https://data.cityofnewyork.us/api/views/{dataset_id}/rows.geojson?accessType=DOWNLOAD"
@@ -253,6 +257,34 @@ def standardize_borough(value: object) -> str:
     key2 = normalize_text_key(raw)
     return BOROUGH_ALIASES.get(key2, raw.title())
 
+
+
+
+def standardize_cdta_code(value: object, borough: object = None) -> str:
+    """Convert Community District identifiers to the first four characters of 2020 NTA codes.
+
+    Examples:
+        301 or BK01 -> BK01
+        101 or MN01 -> MN01
+
+    2020 NTA codes are structured like BK0101, so the first four characters
+    identify the parent Community District Tabulation Area for most dashboard use.
+    """
+    text = str(value).strip().upper() if value is not None and not pd.isna(value) else ""
+    text = re.sub(r"[^A-Z0-9]", "", text)
+    borough_prefixes = {"1": "MN", "2": "BX", "3": "BK", "4": "QN", "5": "SI"}
+    if len(text) >= 4 and text[:2] in {"MN", "BX", "BK", "QN", "SI"}:
+        return text[:4]
+    if text.isdigit() and len(text) >= 3 and text[0] in borough_prefixes:
+        return f"{borough_prefixes[text[0]]}{int(text[1:3]):02d}"
+    if borough is not None and not pd.isna(borough):
+        b = standardize_borough(borough)
+        prefix_map = {"Manhattan": "MN", "Bronx": "BX", "Brooklyn": "BK", "Queens": "QN", "Staten Island": "SI"}
+        prefix = prefix_map.get(b)
+        digits = re.sub(r"\D", "", text)
+        if prefix and digits:
+            return f"{prefix}{int(digits[-2:]):02d}"
+    return text[:4] if text else ""
 
 def safe_float(value: object) -> Optional[float]:
     try:
@@ -598,18 +630,115 @@ def load_nta_boundaries() -> Tuple[pd.DataFrame, Dict[str, str]]:
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_hvi_data() -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """Load Heat Vulnerability Index rankings from NYC Open Data."""
-    status = {"source": "NYC Open Data Heat Vulnerability Index Rankings", "is_mock": "False", "message": ""}
+    """
+    Load Heat Vulnerability Index rankings.
+
+    Production override option:
+        Add data/hvi_nta.csv to the GitHub repo with columns:
+            nta_code, nta_name, hvi_rank
+        or add CDTA proxy rows with:
+            cdta_code, hvi_rank
+
+    This app first checks local CSVs, then uses NYC DOHMH's ArcGIS CDTA-level
+    HVI layer because the NYC Open Data dataset requested by ID 4mhf-duep is
+    published at ZCTA/ZIP geography, which cannot be safely joined to 2020 NTAs
+    without an explicit crosswalk.
+    """
+    status = {"source": "Local data/hvi_nta.csv or official HVI services", "is_mock": "False", "message": ""}
+
+    # 1) Local override. This is useful if the user prepares a verified NTA crosswalk.
+    local_paths = ["data/hvi_nta.csv", "hvi_nta.csv", "data/hvi_cdta.csv", "hvi_cdta.csv"]
+    for path in local_paths:
+        try:
+            df = normalize_columns(pd.read_csv(path))
+            hvi_col = first_existing(
+                df,
+                [
+                    "hvi_rank",
+                    "heat_vulnerability_index",
+                    "heat_vulnerability_index_rank",
+                    "heat_vulnerability",
+                    "hvi",
+                    "rank",
+                    "score",
+                    "hvi_score",
+                    "hvi_ranking",
+                ],
+            )
+            nta_code_col = first_existing(df, ["nta_code", "nta2020", "ntacode", "geoid", "nta"])
+            nta_name_col = first_existing(df, ["nta_name", "ntaname", "ntaname2020", "neighborhood", "name"])
+            cdta_col = first_existing(df, ["cdta_code", "cdta", "community_district", "commdist", "communitydist"])
+            borough_col = first_existing(df, ["borough", "boro", "boroname"])
+            if hvi_col is not None and (nta_code_col is not None or nta_name_col is not None or cdta_col is not None):
+                out = pd.DataFrame()
+                out["hvi_rank"] = pd.to_numeric(df[hvi_col], errors="coerce")
+                if nta_code_col is not None:
+                    out["nta_code"] = df[nta_code_col].astype(str)
+                if nta_name_col is not None:
+                    out["nta_name"] = df[nta_name_col].astype(str)
+                if cdta_col is not None:
+                    if borough_col is not None:
+                        out["cdta_code"] = [standardize_cdta_code(c, b) for c, b in zip(df[cdta_col], df[borough_col])]
+                    else:
+                        out["cdta_code"] = df[cdta_col].map(standardize_cdta_code)
+                out = out.dropna(subset=["hvi_rank"])
+                out["is_mock_hvi"] = False
+                status["source"] = path
+                status["message"] = f"Loaded local HVI data from {path}."
+                return out, status
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            status["message"] = f"Local HVI load failed from {path}: {exc}"
+
+    # 2) Official NYC DOHMH ArcGIS CDTA-level HVI service. This avoids unsafe ZIP-to-NTA joins.
+    try:
+        params = {
+            "where": "1=1",
+            "outFields": "CommDist,Borough,Neighborhood_CD,HVI",
+            "returnGeometry": "false",
+            "f": "json",
+        }
+        resp = requests.get(HVI_CDTA_ARCGIS_URL, params=params, timeout=25)
+        resp.raise_for_status()
+        payload = resp.json()
+        features = payload.get("features", [])
+        rows = [feature.get("attributes", {}) for feature in features]
+        df = normalize_columns(pd.DataFrame(rows))
+        if len(df) > 0:
+            hvi_col = first_existing(df, ["hvi", "hvi_rank"])
+            cd_col = first_existing(df, ["commdist", "community_district", "communitydist"])
+            borough_col = first_existing(df, ["borough", "boro"])
+            label_col = first_existing(df, ["neighborhood_cd", "label"])
+            if hvi_col is not None and cd_col is not None:
+                out = pd.DataFrame()
+                out["hvi_rank"] = pd.to_numeric(df[hvi_col], errors="coerce")
+                out["cdta_code"] = [
+                    standardize_cdta_code(c, b if borough_col is not None else None)
+                    for c, b in zip(df[cd_col], df[borough_col] if borough_col is not None else [None] * len(df))
+                ]
+                if label_col is not None:
+                    out["cdta_name"] = df[label_col].astype(str)
+                out = out.dropna(subset=["hvi_rank"])
+                out = out[out["cdta_code"].astype(str).str.len() > 0]
+                out["is_mock_hvi"] = False
+                status["source"] = "NYC DOHMH ArcGIS HVI by CDTA"
+                status["message"] = "Loaded official NYC DOHMH CDTA-level HVI and will assign it to NTAs by parent CDTA."
+                return out, status
+    except Exception as exc:
+        status["message"] = f"Official ArcGIS CDTA HVI load failed: {exc}"
+
+    # 3) Requested NYC Open Data source. It is ZCTA-based; keep it as a source but do not force a bad join.
+    status["source"] = "NYC Open Data Heat Vulnerability Index Rankings"
     try:
         data = try_request_json(SODA_JSON.format(dataset_id=HVI_ID), timeout=25)
         df = normalize_columns(pd.DataFrame(data))
         if len(df) > 0:
-            status["message"] = "Loaded HVI records from NYC Open Data JSON."
+            status["message"] = "Loaded NYC Open Data HVI records, but they are ZCTA-based and may require a ZIP-to-NTA crosswalk."
             return df, status
     except Exception as exc:
         status["message"] = f"HVI JSON load failed: {exc}"
 
-    # Actual mock HVI needs NTA rows, so classify_priority_areas() can generate it.
     status["source"] = "Mock HVI fallback pending"
     status["is_mock"] = "True"
     status["message"] = "Live HVI loading failed. Mock HVI will be generated after NTA load."
@@ -899,20 +1028,38 @@ def classify_priority_areas(
         status["is_mock_hvi"] = "True"
         status["message"] = "HVI rank column not detected. Using mock HVI rankings."
 
+    cdta_col = first_existing(hvi, ["cdta_code", "cdta", "commdist", "community_district", "communitydist"])
+    borough_col = first_existing(hvi, ["borough", "boro", "boroname"])
+
     clean_hvi = pd.DataFrame()
     clean_hvi["hvi_rank"] = pd.to_numeric(hvi[hvi_col], errors="coerce")
     if code_col is not None:
         clean_hvi["nta_code"] = hvi[code_col].astype(str)
     if name_col is not None:
         clean_hvi["nta_name_key"] = hvi[name_col].map(normalize_text_key)
+    if cdta_col is not None:
+        if borough_col is not None:
+            clean_hvi["cdta_code"] = [standardize_cdta_code(c, b) for c, b in zip(hvi[cdta_col], hvi[borough_col])]
+        else:
+            clean_hvi["cdta_code"] = hvi[cdta_col].map(standardize_cdta_code)
 
     nta["nta_name_key"] = nta["nta_name"].map(normalize_text_key)
+    nta["cdta_code"] = nta["nta_code"].astype(str).str[:4]
 
     joined = nta.copy()
     if "nta_code" in clean_hvi.columns:
         joined = joined.merge(clean_hvi[["nta_code", "hvi_rank"]].dropna(), on="nta_code", how="left")
     else:
         joined["hvi_rank"] = np.nan
+
+    if joined["hvi_rank"].isna().all() and "cdta_code" in clean_hvi.columns:
+        joined = joined.drop(columns=["hvi_rank"], errors="ignore").merge(
+            clean_hvi[["cdta_code", "hvi_rank"]].dropna().drop_duplicates("cdta_code"),
+            on="cdta_code",
+            how="left",
+        )
+        if not joined["hvi_rank"].isna().all():
+            status["message"] = "Joined official CDTA-level HVI to NTAs by parent CDTA code. This is a CDTA-to-NTA proxy, not a direct NTA HVI measurement."
 
     if joined["hvi_rank"].isna().all() and "nta_name_key" in clean_hvi.columns:
         joined = joined.drop(columns=["hvi_rank"], errors="ignore").merge(
